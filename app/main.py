@@ -164,9 +164,12 @@ async def scan_area(
             area_dir.rmdir()
 
     summary_parts: List[str] = []
+    tile_resolution = tiles[0].pixel_size if tiles else None
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
         summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
+    if tile_resolution:
+        summary_parts.append(f"Tile resolution: {tile_resolution}px.")
     download_failures_count = len(download_failures)
     if download_failures_count:
         download_plural = "s" if download_failures_count != 1 else ""
