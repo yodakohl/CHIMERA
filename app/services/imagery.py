@@ -5,6 +5,7 @@ import math
 import shutil
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -30,6 +31,16 @@ GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
 NEIGHBOR_IDENTICAL_THRESHOLD = 0.995
 
+# High-resolution aerial imagery from the USGS National Agriculture Imagery Program
+# (NAIP). Coverage is limited to the continental United States but offers ~1 m per
+# pixel orthophotography which is substantially sharper than the global NASA mosaics.
+NAIP_WMS_URL = "https://services.nationalmap.gov/arcgis/services/USGSNAIPPlus/MapServer/WmsServer"
+NAIP_LAYER_NAME = "0"
+NAIP_IMAGE_FORMAT = "image/jpeg"
+NAIP_PIXELS_PER_DEGREE = 36000
+NAIP_MIN_TILE_PIXELS = 512
+NAIP_MAX_TILE_PIXELS = 4096
+
 RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
 
@@ -37,6 +48,28 @@ MIN_DIM = 0.01
 MAX_DIM = 0.5
 MAX_TILES_PER_RUN = 50
 REQUEST_TIMEOUT = httpx.Timeout(60.0)
+
+
+class ImageryProviderKey(str, Enum):
+    """Identifiers for the supported remote sensing providers."""
+
+    NASA_GIBS = "nasa_gibs"
+    USGS_NAIP = "usgs_naip"
+
+
+ProviderMetadata = Dict[str, str]
+
+
+PROVIDER_METADATA: Dict[ImageryProviderKey, ProviderMetadata] = {
+    ImageryProviderKey.NASA_GIBS: {
+        "label": "NASA GIBS (global satellite mosaics)",
+        "description": "Worldwide coverage using VIIRS imagery with automatic Landsat WELD fallback (~30 m).",
+    },
+    ImageryProviderKey.USGS_NAIP: {
+        "label": "USGS NAIP Plus (US aerial ~1 m)",
+        "description": "High-resolution orthophotos for the continental United States from the National Map.",
+    },
+}
 
 _CAPABILITIES_PARAMS = {
     "SERVICE": "WMS",
@@ -76,7 +109,7 @@ _layer_latest_date_cache: Dict[str, str] = {}
 
 @dataclass
 class AreaTile:
-    """Metadata for a satellite tile downloaded from the NASA GIBS imagery service."""
+    """Metadata describing an imagery tile retrieved from a remote provider."""
 
     lat: float
     lon: float
@@ -86,10 +119,52 @@ class AreaTile:
     degree_size: float
     layer: str
     native_dim: float
-    pixels_per_degree: int
+    pixels_per_degree: float
     low_detail: bool = field(default=False)
     detail_ratio: float | None = field(default=None)
     layer_description: str | None = field(default=None)
+    provider: str = field(default=ImageryProviderKey.NASA_GIBS.value)
+    provider_label: str | None = field(default=None)
+
+
+async def download_area_tiles(
+    *,
+    provider: ImageryProviderKey,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    dim: float,
+    output_dir: Path,
+    date: str | None = None,
+) -> Tuple[List[AreaTile], List[str]]:
+    """Dispatch imagery downloads to the selected remote sensing provider."""
+
+    if isinstance(provider, str):  # pragma: no cover - defensive for direct calls
+        provider = ImageryProviderKey(provider)
+
+    if provider == ImageryProviderKey.NASA_GIBS:
+        return await download_gibs_area_tiles(
+            north=north,
+            south=south,
+            east=east,
+            west=west,
+            dim=dim,
+            output_dir=output_dir,
+            date=date,
+        )
+    if provider == ImageryProviderKey.USGS_NAIP:
+        return await download_naip_area_tiles(
+            north=north,
+            south=south,
+            east=east,
+            west=west,
+            dim=dim,
+            output_dir=output_dir,
+            date=date,
+        )
+
+    raise ValueError(f"Unsupported imagery provider: {provider}")
 
 
 async def download_gibs_area_tiles(
@@ -187,6 +262,141 @@ async def download_gibs_area_tiles(
                     tile.detail_ratio = score
 
     return tiles, aggregated_failures
+
+
+async def download_naip_area_tiles(
+    *,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    dim: float,
+    output_dir: Path,
+    date: str | None = None,
+) -> Tuple[List[AreaTile], List[str]]:
+    """Download high-resolution aerial tiles from the USGS NAIP WMS service."""
+
+    _validate_bounds(north=north, south=south, east=east, west=west)
+    _validate_dim(dim)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    lat_centers = _build_axis_centers(
+        minimum=south,
+        maximum=north,
+        dim=dim,
+        clamp_min=-90.0 + dim / 2,
+        clamp_max=90.0 - dim / 2,
+    )
+    lon_centers = _build_axis_centers(
+        minimum=west,
+        maximum=east,
+        dim=dim,
+        clamp_min=-180.0 + dim / 2,
+        clamp_max=180.0 - dim / 2,
+    )
+
+    total_tiles = len(lat_centers) * len(lon_centers)
+    if total_tiles > MAX_TILES_PER_RUN:
+        raise ValueError(
+            "Requested area requires "
+            f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
+            f"the limit of {MAX_TILES_PER_RUN} requests per scan."
+        )
+
+    tiles: List[AreaTile] = []
+    failures: List[str] = []
+    native_dim = max(MIN_DIM, NAIP_MIN_TILE_PIXELS / NAIP_PIXELS_PER_DEGREE)
+    provider_label = PROVIDER_METADATA[ImageryProviderKey.USGS_NAIP]["label"]
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for lat in lat_centers:
+            for lon in lon_centers:
+                south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+                lat_span = max(north_bound - south_bound, MIN_DIM)
+                lon_span = max(east_bound - west_bound, MIN_DIM)
+                width = _naip_tile_pixels(lon_span)
+                height = _naip_tile_pixels(lat_span)
+                bbox = f"{south_bound:.6f},{west_bound:.6f},{north_bound:.6f},{east_bound:.6f}"
+
+                params = {
+                    "SERVICE": "WMS",
+                    "REQUEST": "GetMap",
+                    "FORMAT": NAIP_IMAGE_FORMAT,
+                    "VERSION": "1.3.0",
+                    "STYLES": "",
+                    "LAYERS": NAIP_LAYER_NAME,
+                    "CRS": "EPSG:4326",
+                    "BBOX": bbox,
+                    "WIDTH": width,
+                    "HEIGHT": height,
+                }
+
+                try:
+                    response = await client.get(NAIP_WMS_URL, params=params)
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail = _short_error_detail(exc.response.text)
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
+                    )
+                    logger.warning(
+                        "USGS NAIP imagery request failed with status %s: %s",
+                        exc.response.status_code,
+                        detail,
+                    )
+                    continue
+                except httpx.RequestError as exc:
+                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
+                    logger.warning("USGS NAIP imagery request error: %s", exc)
+                    continue
+
+                if not _is_image_response(response):
+                    content_type = response.headers.get("Content-Type", "unknown")
+                    detail = _short_error_detail(response.text)
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
+                    )
+                    logger.warning(
+                        "USGS NAIP imagery request returned non-image payload (%s): %s",
+                        content_type,
+                        detail,
+                    )
+                    continue
+
+                filename = _tile_filename(
+                    lat,
+                    lon,
+                    date,
+                    prefix="naip",
+                    extension=".jpg",
+                )
+                tile_path = output_dir / filename
+                tile_path.write_bytes(response.content)
+
+                pixel_size = _actual_tile_size(tile_path, max(width, height))
+                lon_resolution = width / lon_span if lon_span > 0 else 0.0
+                lat_resolution = height / lat_span if lat_span > 0 else 0.0
+                pixels_per_degree = max(lon_resolution, lat_resolution, 0.0)
+
+                tiles.append(
+                    AreaTile(
+                        lat=lat,
+                        lon=lon,
+                        path=tile_path,
+                        source_url=str(response.url),
+                        pixel_size=pixel_size,
+                        degree_size=max(dim, lat_span, lon_span),
+                        layer="USGSNAIPPlus",
+                        native_dim=native_dim,
+                        pixels_per_degree=pixels_per_degree,
+                        layer_description="USGS NAIP Plus aerial imagery (~1 m)",
+                        provider=ImageryProviderKey.USGS_NAIP.value,
+                        provider_label=provider_label,
+                    )
+                )
+
+    return tiles, failures
 
 
 async def _download_with_adaptive_dim(
@@ -379,6 +589,8 @@ async def _download_tiles_for_dim(
                     native_dim=_minimum_native_tile_dim(layer),
                     pixels_per_degree=layer.pixels_per_degree,
                     layer_description=layer.description,
+                    provider=ImageryProviderKey.NASA_GIBS.value,
+                    provider_label=PROVIDER_METADATA[ImageryProviderKey.NASA_GIBS]["label"],
                 )
             )
 
@@ -550,7 +762,7 @@ def _validate_bounds(*, north: float, south: float, east: float, west: float) ->
 def _validate_dim(dim: float) -> None:
     if not (MIN_DIM <= dim <= MAX_DIM):
         raise ValueError(
-            f"Tile size (dim) must be between {MIN_DIM} and {MAX_DIM} degrees as required by the GIBS API."
+            f"Tile size (dim) must be between {MIN_DIM} and {MAX_DIM} degrees for the supported imagery services."
         )
 
 
@@ -582,13 +794,21 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(min(value, maximum), minimum)
 
 
-def _tile_filename(lat: float, lon: float, date: str | None) -> str:
+def _tile_filename(
+    lat: float,
+    lon: float,
+    date: str | None,
+    *,
+    prefix: str = "gibs",
+    extension: str = ".png",
+) -> str:
     lat_token = _sanitize_coord(lat)
     lon_token = _sanitize_coord(lon)
+    suffix = extension if extension.startswith(".") else f".{extension}"
     if date:
         date_token = date.replace("-", "")
-        return f"gibs_{date_token}_{lat_token}_{lon_token}.png"
-    return f"gibs_{lat_token}_{lon_token}.png"
+        return f"{prefix}_{date_token}_{lat_token}_{lon_token}{suffix}"
+    return f"{prefix}_{lat_token}_{lon_token}{suffix}"
 
 
 def _sanitize_coord(value: float) -> str:
@@ -694,6 +914,13 @@ def _tile_pixel_size(dim: float, layer: GibsLayerConfig) -> int:
         estimated_pixels += 1
     estimated_pixels = min(estimated_pixels, layer.max_tile_pixels)
     return int(estimated_pixels)
+
+
+def _naip_tile_pixels(span: float) -> int:
+    estimated = max(int(round(span * NAIP_PIXELS_PER_DEGREE)), NAIP_MIN_TILE_PIXELS)
+    if estimated % 2:
+        estimated += 1
+    return min(estimated, NAIP_MAX_TILE_PIXELS)
 
 
 def _short_error_detail(detail: str) -> str:
