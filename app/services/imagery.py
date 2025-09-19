@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 GIBS_WMS_URL = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
 GIBS_DEFAULT_LAYER = "VIIRS_SNPP_CorrectedReflectance_TrueColor"
 GIBS_IMAGE_FORMAT = "image/png"
-GIBS_TILE_WIDTH = 512
-GIBS_TILE_HEIGHT = 512
+GIBS_PIXELS_PER_DEGREE = 4096
+GIBS_MIN_TILE_PIXELS = 1024
+GIBS_MAX_TILE_PIXELS = 2048
 GIBS_DEFAULT_TIME = "default"
 
 RECENT_LOOKBACK_DAYS = 1
@@ -94,6 +95,8 @@ async def download_gibs_area_tiles(
     tiles: List[AreaTile] = []
     failures: List[str] = []
 
+    tile_pixels = _tile_pixel_size(dim)
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         time_param = await _resolve_time_parameter(client, date)
         for lat in lat_centers:
@@ -107,8 +110,8 @@ async def download_gibs_area_tiles(
                     "VERSION": "1.3.0",
                     "STYLES": "",
                     "LAYERS": GIBS_DEFAULT_LAYER,
-                    "WIDTH": GIBS_TILE_WIDTH,
-                    "HEIGHT": GIBS_TILE_HEIGHT,
+                    "WIDTH": tile_pixels,
+                    "HEIGHT": tile_pixels,
                     "CRS": "EPSG:4326",
                     "BBOX": bbox,
                 }
@@ -374,6 +377,16 @@ def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, floa
     west = _clamp(lon - half_dim, -180.0, 180.0)
     east = _clamp(lon + half_dim, -180.0, 180.0)
     return south, north, west, east
+
+
+def _tile_pixel_size(dim: float) -> int:
+    """Derive the pixel resolution for a GIBS tile based on the requested dimension."""
+
+    estimated_pixels = max(math.ceil(dim * GIBS_PIXELS_PER_DEGREE), GIBS_MIN_TILE_PIXELS)
+    if estimated_pixels % 2:
+        estimated_pixels += 1
+    estimated_pixels = min(estimated_pixels, GIBS_MAX_TILE_PIXELS)
+    return int(estimated_pixels)
 
 
 def _short_error_detail(detail: str) -> str:
