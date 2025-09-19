@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import httpx
 import xml.etree.ElementTree as ET
@@ -27,6 +28,7 @@ GIBS_PIXELS_PER_DEGREE = 1024
 GIBS_MIN_TILE_PIXELS = 256
 GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
+NEIGHBOR_IDENTICAL_THRESHOLD = 0.995
 
 RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
@@ -54,6 +56,8 @@ class AreaTile:
     path: Path
     source_url: str
     pixel_size: int
+    degree_size: float
+    low_detail: bool = field(default=False)
 
 
 async def download_gibs_area_tiles(
@@ -68,8 +72,11 @@ async def download_gibs_area_tiles(
 ) -> Tuple[List[AreaTile], List[str]]:
     """Download a grid of imagery tiles from GIBS that cover the requested bounding box.
 
-    Returns a tuple consisting of successfully downloaded tiles and a list of
-    human-readable error messages for tiles that could not be fetched.
+    The downloader automatically expands the tile size when the requested
+    dimension would produce blocky upscaled imagery so the downstream models
+    receive higher fidelity inputs. Returns a tuple consisting of successfully
+    downloaded tiles and a list of human-readable error messages for tiles that
+    could not be fetched.
     """
 
     _validate_bounds(north=north, south=south, east=east, west=west)
@@ -77,6 +84,83 @@ async def download_gibs_area_tiles(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    requested_dim = dim
+    dim = max(dim, _minimum_native_tile_dim())
+    if dim > requested_dim + 1e-9:
+        logger.info(
+            "Requested tile size %.3f° is below the native resolution of %s; using %.3f° tiles instead.",
+            requested_dim,
+            GIBS_DEFAULT_LAYER,
+            dim,
+        )
+
+    tiles: List[AreaTile] = []
+    failures: List[str] = []
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        time_param = await _resolve_time_parameter(client, date)
+
+        current_dim = dim
+        while True:
+            _clear_output_directory(output_dir)
+            attempt_tiles, attempt_failures = await _download_tiles_for_dim(
+                client=client,
+                time_param=time_param,
+                north=north,
+                south=south,
+                east=east,
+                west=west,
+                dim=current_dim,
+                output_dir=output_dir,
+                date=date,
+            )
+
+            tiles = attempt_tiles
+            failures = attempt_failures
+
+            if not tiles:
+                break
+
+            needs_more_detail, detail_flags = _tiles_need_higher_resolution(tiles)
+
+            if not needs_more_detail or current_dim >= MAX_DIM:
+                for tile, flag in zip(tiles, detail_flags):
+                    tile.low_detail = flag
+                if needs_more_detail and current_dim >= MAX_DIM:
+                    logger.info(
+                        "GIBS tiles remain low detail after reaching the maximum tile size of %.3f°.",
+                        current_dim,
+                    )
+                break
+
+            new_dim = min(MAX_DIM, current_dim * 2)
+            if new_dim <= current_dim + 1e-9:
+                for tile, flag in zip(tiles, detail_flags):
+                    tile.low_detail = flag
+                break
+
+            logger.info(
+                "Tiles downloaded at %.3f° appear low detail (neighboring pixels mostly identical). Retrying with %.3f° tiles.",
+                current_dim,
+                new_dim,
+            )
+            current_dim = new_dim
+
+    return tiles, failures
+
+
+async def _download_tiles_for_dim(
+    *,
+    client: httpx.AsyncClient,
+    time_param: str | None,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    dim: float,
+    output_dir: Path,
+    date: str | None,
+) -> Tuple[List[AreaTile], List[str]]:
     lat_centers = _build_axis_centers(
         minimum=south,
         maximum=north,
@@ -93,7 +177,6 @@ async def download_gibs_area_tiles(
     )
 
     total_tiles = len(lat_centers) * len(lon_centers)
-
     if total_tiles > MAX_TILES_PER_RUN:
         raise ValueError(
             "Requested area requires "
@@ -103,76 +186,74 @@ async def download_gibs_area_tiles(
 
     tiles: List[AreaTile] = []
     failures: List[str] = []
-
     tile_pixels = _tile_pixel_size(dim)
 
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        time_param = await _resolve_time_parameter(client, date)
-        for lat in lat_centers:
-            for lon in lon_centers:
-                south, north, west_bound, east_bound = _tile_bounds(lat, lon, dim)
-                bbox = f"{south:.6f},{west_bound:.6f},{north:.6f},{east_bound:.6f}"
-                params = {
-                    "SERVICE": "WMS",
-                    "REQUEST": "GetMap",
-                    "FORMAT": GIBS_IMAGE_FORMAT,
-                    "VERSION": "1.3.0",
-                    "STYLES": "",
-                    "LAYERS": GIBS_DEFAULT_LAYER,
-                    "WIDTH": tile_pixels,
-                    "HEIGHT": tile_pixels,
-                    "CRS": "EPSG:4326",
-                    "BBOX": bbox,
-                }
+    for lat in lat_centers:
+        for lon in lon_centers:
+            south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+            bbox = f"{south_bound:.6f},{west_bound:.6f},{north_bound:.6f},{east_bound:.6f}"
+            params = {
+                "SERVICE": "WMS",
+                "REQUEST": "GetMap",
+                "FORMAT": GIBS_IMAGE_FORMAT,
+                "VERSION": "1.3.0",
+                "STYLES": "",
+                "LAYERS": GIBS_DEFAULT_LAYER,
+                "WIDTH": tile_pixels,
+                "HEIGHT": tile_pixels,
+                "CRS": "EPSG:4326",
+                "BBOX": bbox,
+            }
 
-                if time_param:
-                    params["TIME"] = time_param
+            if time_param:
+                params["TIME"] = time_param
 
-                try:
-                    response = await client.get(GIBS_WMS_URL, params=params)
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail = _short_error_detail(exc.response.text)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
-                    )
-                    logger.warning(
-                        "GIBS imagery request failed with status %s: %s",
-                        exc.response.status_code,
-                        detail,
-                    )
-                    continue
-                except httpx.RequestError as exc:
-                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
-                    logger.warning("GIBS imagery request error: %s", exc)
-                    continue
-
-                if not _is_image_response(response):
-                    content_type = response.headers.get("Content-Type", "unknown")
-                    detail = _short_error_detail(response.text)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
-                    )
-                    logger.warning(
-                        "GIBS imagery request returned non-image payload (%s): %s",
-                        content_type,
-                        detail,
-                    )
-                    continue
-
-                filename = _tile_filename(lat, lon, date)
-                tile_path = output_dir / filename
-                tile_path.write_bytes(response.content)
-                pixel_size = _actual_tile_size(tile_path, tile_pixels)
-                tiles.append(
-                    AreaTile(
-                        lat=lat,
-                        lon=lon,
-                        path=tile_path,
-                        source_url=str(response.url),
-                        pixel_size=pixel_size,
-                    )
+            try:
+                response = await client.get(GIBS_WMS_URL, params=params)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = _short_error_detail(exc.response.text)
+                failures.append(
+                    f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
                 )
+                logger.warning(
+                    "GIBS imagery request failed with status %s: %s",
+                    exc.response.status_code,
+                    detail,
+                )
+                continue
+            except httpx.RequestError as exc:
+                failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
+                logger.warning("GIBS imagery request error: %s", exc)
+                continue
+
+            if not _is_image_response(response):
+                content_type = response.headers.get("Content-Type", "unknown")
+                detail = _short_error_detail(response.text)
+                failures.append(
+                    f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
+                )
+                logger.warning(
+                    "GIBS imagery request returned non-image payload (%s): %s",
+                    content_type,
+                    detail,
+                )
+                continue
+
+            filename = _tile_filename(lat, lon, date)
+            tile_path = output_dir / filename
+            tile_path.write_bytes(response.content)
+            pixel_size = _actual_tile_size(tile_path, tile_pixels)
+            tiles.append(
+                AreaTile(
+                    lat=lat,
+                    lon=lon,
+                    path=tile_path,
+                    source_url=str(response.url),
+                    pixel_size=pixel_size,
+                    degree_size=dim,
+                )
+            )
 
     return tiles, failures
 
@@ -388,6 +469,76 @@ def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, floa
     west = _clamp(lon - half_dim, -180.0, 180.0)
     east = _clamp(lon + half_dim, -180.0, 180.0)
     return south, north, west, east
+
+
+def _tiles_need_higher_resolution(tiles: Sequence[AreaTile]) -> Tuple[bool, List[bool]]:
+    if not tiles:
+        return False, []
+
+    low_detail_flags: List[bool] = []
+    low_detail_count = 0
+    for tile in tiles:
+        is_low_detail = _tile_has_nearly_identical_neighbors(tile.path)
+        low_detail_flags.append(is_low_detail)
+        if is_low_detail:
+            low_detail_count += 1
+
+    threshold = max(1, len(tiles) // 2)
+    needs_more_detail = low_detail_count >= threshold
+    return needs_more_detail, low_detail_flags
+
+
+def _tile_has_nearly_identical_neighbors(tile_path: Path) -> bool:
+    try:
+        with Image.open(tile_path) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            if width < 2 or height < 2:
+                return True
+
+            pixels = image.load()
+            identical = 0
+            comparisons = 0
+
+            for y in range(height):
+                for x in range(width):
+                    if x > 0:
+                        comparisons += 1
+                        if pixels[x, y] == pixels[x - 1, y]:
+                            identical += 1
+                    if y > 0:
+                        comparisons += 1
+                        if pixels[x, y] == pixels[x, y - 1]:
+                            identical += 1
+
+            if comparisons == 0:
+                return True
+
+            ratio = identical / comparisons
+            return ratio >= NEIGHBOR_IDENTICAL_THRESHOLD
+    except Exception:
+        return False
+
+
+def _clear_output_directory(output_dir: Path) -> None:
+    try:
+        entries = list(output_dir.iterdir())
+    except FileNotFoundError:
+        return
+
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink()
+        except OSError:
+            logger.warning("Failed to remove temporary imagery file %s", entry)
+
+
+def _minimum_native_tile_dim() -> float:
+    native_min = GIBS_MIN_TILE_PIXELS / GIBS_PIXELS_PER_DEGREE
+    return max(MIN_DIM, native_min)
 
 
 def _tile_pixel_size(dim: float) -> int:

@@ -15,7 +15,13 @@ from sqlmodel import Session, select
 from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult
 from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
-from .services.imagery import download_gibs_area_tiles
+from .services.imagery import (
+    GIBS_MIN_TILE_PIXELS,
+    GIBS_PIXELS_PER_DEGREE,
+    MAX_DIM,
+    MIN_DIM,
+    download_gibs_area_tiles,
+)
 
 app = FastAPI(title="Satellite Infrastructure Scanner", version="0.1.0")
 
@@ -165,11 +171,38 @@ async def scan_area(
 
     summary_parts: List[str] = []
     tile_resolution = tiles[0].pixel_size if tiles else None
+    tile_span = tiles[0].degree_size if tiles else None
+    low_detail_remaining = any(tile.low_detail for tile in tiles)
+    native_tile_span = max(MIN_DIM, GIBS_MIN_TILE_PIXELS / GIBS_PIXELS_PER_DEGREE)
+    base_span = max(tile_size, native_tile_span)
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
         summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
+    if tile_span is not None:
+        summary_parts.append(f"Tile span: {tile_span:.3f}°.")
+        if abs(tile_span - tile_size) > 1e-6:
+            if tile_span > base_span + 1e-9:
+                summary_parts.append(
+                    "Tiles were merged into larger requests after detecting blocky imagery."
+                )
+            else:
+                summary_parts.append(
+                    "Tile span increased from requested "
+                    f"{tile_size:.3f}° to {tile_span:.3f}° to match the layer's "
+                    f"native resolution (~{native_tile_span:.3f}°)."
+                )
     if tile_resolution:
         summary_parts.append(f"Tile resolution: {tile_resolution}px per side.")
+    if low_detail_remaining:
+        if tile_span is not None and tile_span >= MAX_DIM - 1e-9:
+            summary_parts.append(
+                "Imagery still appears low detail even at the maximum supported tile span; "
+                "higher resolution data may not be available from the source."
+            )
+        else:
+            summary_parts.append(
+                "Some tiles still appear low detail; consider enlarging the coverage further."
+            )
     download_failures_count = len(download_failures)
     if download_failures_count:
         download_plural = "s" if download_failures_count != 1 else ""
