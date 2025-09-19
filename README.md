@@ -47,7 +47,8 @@ Key features:
    results so you can revisit previous detections.
 
    The application defaults to the public `DEMO_KEY`, which is limited to roughly 30 requests per
-   hour. Add your own NASA API key via the form for higher throughput or larger areas.
+   hour and a maximum of two imagery tiles per scan. Add your own NASA API key via the form for
+   higher throughput or larger areas.
 
 Uploaded imagery is stored under `data/uploads`, and analysis metadata is tracked in the
 `data/satellite_scans.db` SQLite database.

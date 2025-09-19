@@ -16,6 +16,7 @@ dependencies = [
     "pillow>=9.5.0",
     "transformers>=4.37.2",
     "torch>=2.1.0",
+    "timm>=0.9.12",
 ]
 
 [tool.setuptools]
