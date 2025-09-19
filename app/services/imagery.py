@@ -19,9 +19,12 @@ GIBS_IMAGE_FORMAT = "image/png"
 # The VIIRS "best" layer provides roughly 1 km per pixel resolution which equates to
 # ~1024 pixels per degree at the equator. Requesting larger tiles simply produces
 # upscaled imagery without exposing additional detail, so we derive tile sizes from the
-# native resolution instead of forcing multi-thousand pixel requests.
+# native resolution instead of forcing multi-thousand pixel requests. Extremely small
+# bounding boxes would otherwise result in 10–50 pixel images that are unusable for the
+# downstream vision models, therefore each request is clamped to a minimum of 256 pixels
+# per side.
 GIBS_PIXELS_PER_DEGREE = 1024
-GIBS_MIN_TILE_PIXELS = 8
+GIBS_MIN_TILE_PIXELS = 256
 GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
 
@@ -388,7 +391,12 @@ def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, floa
 
 
 def _tile_pixel_size(dim: float) -> int:
-    """Derive the pixel resolution for a GIBS tile based on the requested dimension."""
+    """Derive the pixel resolution for a GIBS tile based on the requested dimension.
+
+    The computation respects the native resolution of the layer while ensuring that the
+    resulting imagery is never smaller than ``GIBS_MIN_TILE_PIXELS`` so the downstream
+    analysis models receive sufficiently detailed inputs.
+    """
 
     estimated_pixels = max(math.ceil(dim * GIBS_PIXELS_PER_DEGREE), GIBS_MIN_TILE_PIXELS)
     if estimated_pixels % 2:

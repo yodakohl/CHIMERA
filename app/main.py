@@ -169,7 +169,7 @@ async def scan_area(
         processed_plural = "s" if processed_count != 1 else ""
         summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
     if tile_resolution:
-        summary_parts.append(f"Tile resolution: {tile_resolution}px.")
+        summary_parts.append(f"Tile resolution: {tile_resolution}px per side.")
     download_failures_count = len(download_failures)
     if download_failures_count:
         download_plural = "s" if download_failures_count != 1 else ""
