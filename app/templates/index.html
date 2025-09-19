@@ -50,6 +50,7 @@
               step="0.0001"
               min="-90"
               max="90"
+              value="{{ '%.4f'|format(default_bounds.north) }}"
               required
             />
           </div>
@@ -62,6 +63,7 @@
               step="0.0001"
               min="-90"
               max="90"
+              value="{{ '%.4f'|format(default_bounds.south) }}"
               required
             />
           </div>
@@ -74,6 +76,7 @@
               step="0.0001"
               min="-180"
               max="180"
+              value="{{ '%.4f'|format(default_bounds.west) }}"
               required
             />
           </div>
@@ -86,6 +89,7 @@
               step="0.0001"
               min="-180"
               max="180"
+              value="{{ '%.4f'|format(default_bounds.east) }}"
               required
             />
           </div>
@@ -98,13 +102,18 @@
               step="0.01"
               min="0.01"
               max="0.5"
-              value="0.05"
+              value="{{ '%.2f'|format(default_tile_size) }}"
               required
             />
           </div>
           <div class="field">
             <label for="date">Acquisition date (optional)</label>
-            <input id="date" name="date" type="date" />
+            <input
+              id="date"
+              name="date"
+              type="date"
+              {% if default_date %}value="{{ default_date }}"{% endif %}
+            />
           </div>
           <div class="field">
             <label for="api-key">NASA API key (optional)</label>

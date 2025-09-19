@@ -28,6 +28,16 @@ AREA_SCAN_DIR.mkdir(parents=True, exist_ok=True)
 
 NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
 
+DEFAULT_SCAN_BOUNDS = {
+    "north": 37.83,
+    "south": 37.73,
+    "west": -122.52,
+    "east": -122.47,
+}
+# A 0.05° tile size keeps the DEMO_KEY requests at two tiles for the default bounding box.
+DEFAULT_SCAN_TILE_SIZE = 0.05
+DEFAULT_SCAN_DATE: str | None = None
+
 logger = logging.getLogger(__name__)
 
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -74,13 +84,13 @@ async def analyze(
 @app.post("/scan-area", response_class=HTMLResponse)
 async def scan_area(
     request: Request,
-    north: float = Form(...),
-    south: float = Form(...),
-    east: float = Form(...),
-    west: float = Form(...),
-    tile_size: float = Form(0.05),
+    north: float = Form(DEFAULT_SCAN_BOUNDS["north"]),
+    south: float = Form(DEFAULT_SCAN_BOUNDS["south"]),
+    east: float = Form(DEFAULT_SCAN_BOUNDS["east"]),
+    west: float = Form(DEFAULT_SCAN_BOUNDS["west"]),
+    tile_size: float = Form(DEFAULT_SCAN_TILE_SIZE),
     prompt: str = Form(DEFAULT_PROMPT),
-    date: str | None = Form(None),
+    date: str | None = Form(DEFAULT_SCAN_DATE),
     api_key: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
@@ -120,6 +130,8 @@ async def scan_area(
             failures_count = len(download_failures)
             failure_plural = "s" if failures_count != 1 else ""
             base_message += f" {failures_count} NASA request{failure_plural} failed."
+            first_failure = download_failures[0]
+            base_message += f" First failure detail: {first_failure}."
         return _render_home(request, session, message=base_message)
 
     processed_records: List[AnalysisResult] = []
@@ -165,6 +177,7 @@ async def scan_area(
     if download_failures_count:
         download_plural = "s" if download_failures_count != 1 else ""
         summary_parts.append(f"{download_failures_count} download{download_plural} failed.")
+        summary_parts.append(f"Example failure: {download_failures[0]}.")
     analysis_failures_count = len(analysis_failures)
     if analysis_failures_count:
         analysis_plural = "s" if analysis_failures_count != 1 else ""
@@ -206,6 +219,9 @@ def _render_home(request: Request, session: Session, message: str | None = None)
         "request": request,
         "default_prompt": DEFAULT_PROMPT,
         "results": _build_results(session),
+        "default_bounds": DEFAULT_SCAN_BOUNDS,
+        "default_tile_size": DEFAULT_SCAN_TILE_SIZE,
+        "default_date": DEFAULT_SCAN_DATE,
     }
     if message:
         context["message"] = message
