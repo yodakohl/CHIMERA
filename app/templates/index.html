@@ -36,8 +36,9 @@
       <h2>Automatic area scan</h2>
       <p>
         Request imagery for a latitude/longitude bounding box and the scanner will automatically
-        download tiles from NASA's Global Imagery Browse Services (GIBS) before running the analysis
-        pipeline on each tile.
+        download tiles from the selected provider before running the analysis pipeline on each tile.
+        NASA's Global Imagery Browse Services (GIBS) offers worldwide coverage, while the USGS NAIP
+        option delivers sub-meter aerial photography across the continental United States.
       </p>
       <form class="form-card" action="/scan-area" method="post">
         <div class="form-grid">
@@ -107,6 +108,21 @@
             />
           </div>
           <div class="field">
+            <label for="provider">Imagery source</label>
+            <select id="provider" name="provider">
+              {% for option in providers %}
+              <option
+                value="{{ option.key }}"
+                title="{{ option.description }}"
+                {% if option.key == selected_provider %}selected{% endif %}
+              >
+                {{ option.label }}
+              </option>
+              {% endfor %}
+            </select>
+            <p class="hint">Hover the options for coverage and resolution details.</p>
+          </div>
+          <div class="field">
             <label for="date">Acquisition date (optional)</label>
             <input
               id="date"
@@ -118,7 +134,7 @@
         </div>
         <p class="hint">
           Large areas may require increasing the tile size to stay under the built-in limit of 50
-          GIBS requests per scan.
+          imagery requests per scan.
         </p>
 
         <label for="area-prompt">Analysis prompt</label>

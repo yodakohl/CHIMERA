@@ -19,7 +19,9 @@ from .services.imagery import (
     GIBS_DEFAULT_LAYER,
     MAX_DIM,
     MIN_DIM,
-    download_gibs_area_tiles,
+    ImageryProviderKey,
+    PROVIDER_METADATA,
+    download_area_tiles,
 )
 
 app = FastAPI(title="Satellite Infrastructure Scanner", version="0.1.0")
@@ -39,6 +41,17 @@ DEFAULT_SCAN_BOUNDS = {
 # A 0.05° tile size yields a compact 2x1 grid for the default bounding box.
 DEFAULT_SCAN_TILE_SIZE = 0.05
 DEFAULT_SCAN_DATE: str | None = None
+DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.NASA_GIBS
+
+
+PROVIDER_OPTIONS = [
+    {
+        "key": key.value,
+        "label": metadata["label"],
+        "description": metadata["description"],
+    }
+    for key, metadata in PROVIDER_METADATA.items()
+]
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +104,7 @@ async def scan_area(
     east: float = Form(DEFAULT_SCAN_BOUNDS["east"]),
     west: float = Form(DEFAULT_SCAN_BOUNDS["west"]),
     tile_size: float = Form(DEFAULT_SCAN_TILE_SIZE),
+    provider: ImageryProviderKey = Form(DEFAULT_IMAGERY_PROVIDER),
     prompt: str = Form(DEFAULT_PROMPT),
     date: str | None = Form(DEFAULT_SCAN_DATE),
     session: Session = Depends(get_session),
@@ -99,9 +113,12 @@ async def scan_area(
     area_dir = AREA_SCAN_DIR / datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
     requested_date = (date or "").strip() or None
+    provider_meta = PROVIDER_METADATA.get(provider, {})
+    provider_label = provider_meta.get("label", provider.value)
 
     try:
-        tiles, download_failures = await download_gibs_area_tiles(
+        tiles, download_failures = await download_area_tiles(
+            provider=provider,
             north=north,
             south=south,
             east=east,
@@ -116,7 +133,12 @@ async def scan_area(
                 area_dir.rmdir()
             except OSError:
                 shutil.rmtree(area_dir, ignore_errors=True)
-        return _render_home(request, session, message=str(exc))
+        return _render_home(
+            request,
+            session,
+            message=str(exc),
+            selected_provider=provider.value,
+        )
 
     if not tiles:
         if area_dir.exists():
@@ -128,10 +150,17 @@ async def scan_area(
         if download_failures:
             failures_count = len(download_failures)
             failure_plural = "s" if failures_count != 1 else ""
-            base_message += f" {failures_count} GIBS request{failure_plural} failed."
+            base_message += f" {failures_count} imagery request{failure_plural} failed."
             first_failure = download_failures[0]
             base_message += f" First failure detail: {first_failure}."
-        return _render_home(request, session, message=base_message)
+        if provider_label:
+            base_message += f" Provider: {provider_label}."
+        return _render_home(
+            request,
+            session,
+            message=base_message,
+            selected_provider=provider.value,
+        )
 
     processed_records: List[AnalysisResult] = []
     analysis_failures: List[str] = []
@@ -169,6 +198,8 @@ async def scan_area(
             area_dir.rmdir()
 
     summary_parts: List[str] = []
+    if provider_label:
+        summary_parts.append(f"Imagery provider: {provider_label}.")
     tile_resolution = tiles[0].pixel_size if tiles else None
     tile_span = tiles[0].degree_size if tiles else None
     tile_layer = tiles[0].layer if tiles else None
@@ -182,11 +213,14 @@ async def scan_area(
     detail_ratios = [tile.detail_ratio for tile in tiles if tile.detail_ratio is not None]
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
-        summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
+        summary_parts.append(f"Analyzed {processed_count} imagery tile{processed_plural}.")
     if tile_layer:
         description = layer_description or tile_layer
         summary_parts.append(f"Imagery layer: {description}.")
-        if tile_layer != GIBS_DEFAULT_LAYER:
+        if (
+            provider == ImageryProviderKey.NASA_GIBS
+            and tile_layer != GIBS_DEFAULT_LAYER
+        ):
             summary_parts.append(
                 "Switched to a higher-resolution NASA mosaic after the default VIIRS imagery appeared too blocky."
             )
@@ -237,7 +271,12 @@ async def scan_area(
         )
 
     message = " ".join(summary_parts) or "Area scan completed."
-    return _render_home(request, session, message=message)
+    return _render_home(
+        request,
+        session,
+        message=message,
+        selected_provider=provider.value,
+    )
 
 
 def _safe_filename(filename: str) -> str:
@@ -265,7 +304,13 @@ def _build_results(session: Session) -> List[Dict[str, object]]:
     ]
 
 
-def _render_home(request: Request, session: Session, message: str | None = None):
+def _render_home(
+    request: Request,
+    session: Session,
+    message: str | None = None,
+    *,
+    selected_provider: str | None = None,
+):
     context: Dict[str, object] = {
         "request": request,
         "default_prompt": DEFAULT_PROMPT,
@@ -273,6 +318,9 @@ def _render_home(request: Request, session: Session, message: str | None = None)
         "default_bounds": DEFAULT_SCAN_BOUNDS,
         "default_tile_size": DEFAULT_SCAN_TILE_SIZE,
         "default_date": DEFAULT_SCAN_DATE,
+        "providers": PROVIDER_OPTIONS,
+        "default_provider": DEFAULT_IMAGERY_PROVIDER.value,
+        "selected_provider": selected_provider or DEFAULT_IMAGERY_PROVIDER.value,
     }
     if message:
         context["message"] = message
