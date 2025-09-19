@@ -36,8 +36,8 @@
       <h2>Automatic area scan</h2>
       <p>
         Request imagery for a latitude/longitude bounding box and the scanner will automatically
-        download tiles from the free NASA Earth imagery API before running the analysis pipeline on
-        each tile.
+        download tiles from NASA's Global Imagery Browse Services (GIBS) before running the analysis
+        pipeline on each tile.
       </p>
       <form class="form-card" action="/scan-area" method="post">
         <div class="form-grid">
@@ -115,14 +115,10 @@
               {% if default_date %}value="{{ default_date }}"{% endif %}
             />
           </div>
-          <div class="field">
-            <label for="api-key">NASA API key (optional)</label>
-            <input id="api-key" name="api_key" type="text" placeholder="Defaults to DEMO_KEY" />
-          </div>
         </div>
         <p class="hint">
-          Large areas may require increasing the tile size to stay under the public NASA DEMO_KEY
-          rate limits. Provide your own API key for higher throughput.
+          Large areas may require increasing the tile size to stay under the built-in limit of 50
+          GIBS requests per scan.
         </p>
 
         <label for="area-prompt">Analysis prompt</label>

@@ -13,7 +13,7 @@ Key features:
 - **General object detection** powered by a DETR model capable of identifying a broad range of
   infrastructure and equipment beyond a fixed list of examples.
 - **Persistent storage** of every analysis run, including references to uploaded imagery.
-- **Automatic area scanning** by fetching NASA Earth imagery tiles for a bounding box and analyzing
+- **Automatic area scanning** by fetching NASA GIBS imagery tiles for a bounding box and analyzing
   them without preparing archives.
 
 ## Getting started
@@ -43,12 +43,9 @@ Key features:
 
 4. Open <http://localhost:8000> in your browser. You can either upload a single satellite image or
    use the automatic area scan form to request imagery for a latitude/longitude bounding box. The
-   app downloads tiles from the free NASA Earth imagery API, analyzes each tile, and stores the
-   results so you can revisit previous detections.
-
-   The application defaults to the public `DEMO_KEY`, which is limited to roughly 30 requests per
-   hour and a maximum of two imagery tiles per scan. Add your own NASA API key via the form for
-   higher throughput or larger areas.
+   app downloads tiles from NASA's Global Imagery Browse Services (GIBS), analyzes each tile, and
+   stores the results so you can revisit previous detections. Each scan is limited to 50 GIBS
+   requests to prevent accidental overload of the service.
 
 Uploaded imagery is stored under `data/uploads`, and analysis metadata is tracked in the
 `data/satellite_scans.db` SQLite database.

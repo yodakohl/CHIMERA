@@ -8,12 +8,15 @@ from typing import List, Tuple
 
 import httpx
 
-DEMO_API_KEY = "DEMO_KEY"
-DEMO_KEY_TILE_LIMIT = 2
-
 logger = logging.getLogger(__name__)
 
-NASA_EARTH_IMAGERY_URL = "https://api.nasa.gov/planetary/earth/imagery"
+GIBS_WMS_URL = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+GIBS_DEFAULT_LAYER = "VIIRS_SNPP_CorrectedReflectance_TrueColor"
+GIBS_IMAGE_FORMAT = "image/png"
+GIBS_TILE_WIDTH = 512
+GIBS_TILE_HEIGHT = 512
+GIBS_DEFAULT_TIME = "default"
+
 MIN_DIM = 0.01
 MAX_DIM = 0.5
 MAX_TILES_PER_RUN = 50
@@ -22,7 +25,7 @@ REQUEST_TIMEOUT = httpx.Timeout(60.0)
 
 @dataclass
 class AreaTile:
-    """Metadata for a satellite tile downloaded from the NASA imagery API."""
+    """Metadata for a satellite tile downloaded from the NASA GIBS imagery service."""
 
     lat: float
     lon: float
@@ -30,7 +33,7 @@ class AreaTile:
     source_url: str
 
 
-async def download_nasa_area_tiles(
+async def download_gibs_area_tiles(
     *,
     north: float,
     south: float,
@@ -38,10 +41,9 @@ async def download_nasa_area_tiles(
     west: float,
     dim: float,
     output_dir: Path,
-    api_key: str,
     date: str | None = None,
 ) -> Tuple[List[AreaTile], List[str]]:
-    """Download a grid of imagery tiles that cover the requested bounding box.
+    """Download a grid of imagery tiles from GIBS that cover the requested bounding box.
 
     Returns a tuple consisting of successfully downloaded tiles and a list of
     human-readable error messages for tiles that could not be fetched.
@@ -69,14 +71,7 @@ async def download_nasa_area_tiles(
 
     total_tiles = len(lat_centers) * len(lon_centers)
 
-    max_tiles_for_key = _max_tiles_for_api_key(api_key)
-    if total_tiles > max_tiles_for_key:
-        if _is_demo_key(api_key):
-            raise ValueError(
-                "The NASA DEMO_KEY may only be used for two imagery requests at a time. "
-                f"The requested area would require {total_tiles} tiles. Reduce the coverage or "
-                "use your own NASA API key."
-            )
+    if total_tiles > MAX_TILES_PER_RUN:
         raise ValueError(
             "Requested area requires "
             f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
@@ -86,20 +81,29 @@ async def download_nasa_area_tiles(
     tiles: List[AreaTile] = []
     failures: List[str] = []
 
+    time_param = date or GIBS_DEFAULT_TIME
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for lat in lat_centers:
             for lon in lon_centers:
+                south, north, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+                bbox = f"{south:.6f},{west_bound:.6f},{north:.6f},{east_bound:.6f}"
                 params = {
-                    "lat": lat,
-                    "lon": lon,
-                    "dim": dim,
-                    "api_key": api_key,
+                    "SERVICE": "WMS",
+                    "REQUEST": "GetMap",
+                    "FORMAT": GIBS_IMAGE_FORMAT,
+                    "VERSION": "1.3.0",
+                    "STYLES": "",
+                    "LAYERS": GIBS_DEFAULT_LAYER,
+                    "WIDTH": GIBS_TILE_WIDTH,
+                    "HEIGHT": GIBS_TILE_HEIGHT,
+                    "CRS": "EPSG:4326",
+                    "BBOX": bbox,
+                    "TIME": time_param,
                 }
-                if date:
-                    params["date"] = date
 
                 try:
-                    response = await client.get(NASA_EARTH_IMAGERY_URL, params=params)
+                    response = await client.get(GIBS_WMS_URL, params=params)
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
                     detail = _short_error_detail(exc.response.text)
@@ -107,14 +111,27 @@ async def download_nasa_area_tiles(
                         f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
                     )
                     logger.warning(
-                        "NASA imagery request failed with status %s: %s",
+                        "GIBS imagery request failed with status %s: %s",
                         exc.response.status_code,
                         detail,
                     )
                     continue
                 except httpx.RequestError as exc:
                     failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
-                    logger.warning("NASA imagery request error: %s", exc)
+                    logger.warning("GIBS imagery request error: %s", exc)
+                    continue
+
+                if not _is_image_response(response):
+                    content_type = response.headers.get("Content-Type", "unknown")
+                    detail = _short_error_detail(response.text)
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
+                    )
+                    logger.warning(
+                        "GIBS imagery request returned non-image payload (%s): %s",
+                        content_type,
+                        detail,
+                    )
                     continue
 
                 filename = _tile_filename(lat, lon, date)
@@ -150,7 +167,7 @@ def _validate_bounds(*, north: float, south: float, east: float, west: float) ->
 def _validate_dim(dim: float) -> None:
     if not (MIN_DIM <= dim <= MAX_DIM):
         raise ValueError(
-            f"Tile size (dim) must be between {MIN_DIM} and {MAX_DIM} degrees as required by the NASA API."
+            f"Tile size (dim) must be between {MIN_DIM} and {MAX_DIM} degrees as required by the GIBS API."
         )
 
 
@@ -187,13 +204,22 @@ def _tile_filename(lat: float, lon: float, date: str | None) -> str:
     lon_token = _sanitize_coord(lon)
     if date:
         date_token = date.replace("-", "")
-        return f"nasa_{date_token}_{lat_token}_{lon_token}.png"
-    return f"nasa_{lat_token}_{lon_token}.png"
+        return f"gibs_{date_token}_{lat_token}_{lon_token}.png"
+    return f"gibs_{lat_token}_{lon_token}.png"
 
 
 def _sanitize_coord(value: float) -> str:
     token = f"{value:+.4f}".replace("+", "p").replace("-", "m").replace(".", "_")
     return token
+
+
+def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, float, float]:
+    half_dim = dim / 2
+    south = _clamp(lat - half_dim, -90.0, 90.0)
+    north = _clamp(lat + half_dim, -90.0, 90.0)
+    west = _clamp(lon - half_dim, -180.0, 180.0)
+    east = _clamp(lon + half_dim, -180.0, 180.0)
+    return south, north, west, east
 
 
 def _short_error_detail(detail: str) -> str:
@@ -203,11 +229,10 @@ def _short_error_detail(detail: str) -> str:
     return detail or "(no detail)"
 
 
-def _max_tiles_for_api_key(api_key: str) -> int:
-    if _is_demo_key(api_key):
-        return min(MAX_TILES_PER_RUN, DEMO_KEY_TILE_LIMIT)
-    return MAX_TILES_PER_RUN
+def _is_image_response(response: httpx.Response) -> bool:
+    content_type = response.headers.get("Content-Type", "")
+    return "image" in content_type.lower()
 
 
-def _is_demo_key(api_key: str) -> bool:
-    return (api_key or "").strip().upper() == DEMO_API_KEY
+# Backwards compatibility for older imports
+download_nasa_area_tiles = download_gibs_area_tiles
