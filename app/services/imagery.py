@@ -321,76 +321,108 @@ async def download_naip_area_tiles(
                 lon_span = max(east_bound - west_bound, MIN_DIM)
                 width = _naip_tile_pixels(lon_span)
                 height = _naip_tile_pixels(lat_span)
-                # ArcGIS-based WMS endpoints (including USGS NAIP) expect the axis order to
-                # remain longitude, latitude even when using the WMS 1.3.0 ``CRS`` parameter.
-                # When we send the more standards-compliant latitude/longitude ordering used
-                # elsewhere in the downloader the service returns a 400 response for locations
-                # whose longitude falls outside the ``[-90, 90]`` latitude domain (for example
-                # the Pacific Northwest).  Reversing the order to west/south/east/north matches
-                # the behaviour of the ArcGIS clients and restores access to NAIP tiles across
-                # the continental United States.
-                bbox = f"{west_bound:.6f},{south_bound:.6f},{east_bound:.6f},{north_bound:.6f}"
 
-                params = {
+                bbox_lon_lat = (
+                    f"{west_bound:.6f},{south_bound:.6f},{east_bound:.6f},{north_bound:.6f}"
+                )
+                bbox_lat_lon = (
+                    f"{south_bound:.6f},{west_bound:.6f},{north_bound:.6f},{east_bound:.6f}"
+                )
+
+                base_params = {
                     "SERVICE": "WMS",
                     "REQUEST": "GetMap",
                     "FORMAT": NAIP_IMAGE_FORMAT,
-                    "VERSION": "1.3.0",
                     "STYLES": "",
                     "LAYERS": NAIP_LAYER_NAME,
-                    "CRS": "EPSG:4326",
-                    "BBOX": bbox,
                     "WIDTH": width,
                     "HEIGHT": height,
                 }
 
+                request_attempts = [
+                    ("1.3.0", "CRS", bbox_lon_lat, "lon-lat"),
+                    ("1.3.0", "CRS", bbox_lat_lon, "lat-lon"),
+                    ("1.1.1", "SRS", bbox_lon_lat, "lon-lat"),
+                ]
+
                 response: httpx.Response | None = None
                 last_error: str | None = None
+                success_attempt: tuple[str, str] | None = None
 
-                for endpoint in NAIP_WMS_URLS:
-                    try:
-                        candidate = await client.get(endpoint, params=params)
-                        candidate.raise_for_status()
-                    except httpx.HTTPStatusError as exc:
-                        detail = _short_error_detail(exc.response.text)
-                        last_error = f"{exc.response.status_code} {detail} (endpoint {endpoint})"
-                        logger.warning(
-                            "USGS NAIP imagery request failed with status %s from %s: %s",
-                            exc.response.status_code,
-                            endpoint,
-                            detail,
-                        )
-                        continue
-                    except httpx.RequestError as exc:
-                        last_error = f"{exc} (endpoint {endpoint})"
-                        logger.warning(
-                            "USGS NAIP imagery request error from %s: %s",
-                            endpoint,
-                            exc,
-                        )
-                        continue
+                for version, crs_key, bbox_value, axis_label in request_attempts:
+                    params = dict(base_params)
+                    params["VERSION"] = version
+                    params["BBOX"] = bbox_value
+                    params[crs_key] = "EPSG:4326"
 
-                    if not _is_image_response(candidate):
-                        content_type = candidate.headers.get("Content-Type", "unknown")
-                        detail = _short_error_detail(candidate.text)
-                        last_error = (
-                            f"unexpected payload ({content_type}) from {endpoint}: {detail}"
-                        )
-                        logger.warning(
-                            "USGS NAIP imagery request returned non-image payload (%s) from %s: %s",
-                            content_type,
-                            endpoint,
-                            detail,
-                        )
-                        continue
+                    for endpoint in NAIP_WMS_URLS:
+                        try:
+                            candidate = await client.get(endpoint, params=params)
+                            candidate.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            detail = _short_error_detail(exc.response.text)
+                            last_error = (
+                                f"{exc.response.status_code} {detail} "
+                                f"(endpoint {endpoint}, version {version}, axis {axis_label})"
+                            )
+                            logger.warning(
+                                "USGS NAIP imagery request failed with status %s from %s (version %s, %s axis order): %s",
+                                exc.response.status_code,
+                                endpoint,
+                                version,
+                                axis_label,
+                                detail,
+                            )
+                            continue
+                        except httpx.RequestError as exc:
+                            last_error = (
+                                f"{exc} (endpoint {endpoint}, version {version}, axis {axis_label})"
+                            )
+                            logger.warning(
+                                "USGS NAIP imagery request error from %s (version %s, %s axis order): %s",
+                                endpoint,
+                                version,
+                                axis_label,
+                                exc,
+                            )
+                            continue
 
-                    response = candidate
-                    if endpoint != NAIP_WMS_URLS[0]:
-                        logger.info(
-                            "USGS NAIP imagery request succeeded using fallback endpoint %s",
-                            endpoint,
-                        )
-                    break
+                        if not _is_image_response(candidate):
+                            content_type = candidate.headers.get("Content-Type", "unknown")
+                            detail = _short_error_detail(candidate.text)
+                            last_error = (
+                                f"unexpected payload ({content_type}) from {endpoint}, version {version}, "
+                                f"axis {axis_label}: {detail}"
+                            )
+                            logger.warning(
+                                "USGS NAIP imagery request returned non-image payload (%s) from %s (version %s, %s axis order): %s",
+                                content_type,
+                                endpoint,
+                                version,
+                                axis_label,
+                                detail,
+                            )
+                            continue
+
+                        response = candidate
+                        success_attempt = (version, axis_label)
+                        if endpoint != NAIP_WMS_URLS[0]:
+                            logger.info(
+                                "USGS NAIP imagery request succeeded using fallback endpoint %s (version %s, %s axis order)",
+                                endpoint,
+                                version,
+                                axis_label,
+                            )
+                        break
+
+                    if response is not None:
+                        if success_attempt != ("1.3.0", "lon-lat"):
+                            logger.info(
+                                "USGS NAIP imagery request succeeded using alternate configuration (version %s, %s axis order)",
+                                version,
+                                axis_label,
+                            )
+                        break
 
                 if response is None:
                     error_message = last_error or "no NAIP endpoints available"
