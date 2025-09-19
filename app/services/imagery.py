@@ -34,7 +34,11 @@ NEIGHBOR_IDENTICAL_THRESHOLD = 0.995
 # High-resolution aerial imagery from the USGS National Agriculture Imagery Program
 # (NAIP). Coverage is limited to the continental United States but offers ~1 m per
 # pixel orthophotography which is substantially sharper than the global NASA mosaics.
-NAIP_WMS_URL = "https://services.nationalmap.gov/arcgis/services/USGSNAIPPlus/MapServer/WmsServer"
+NAIP_WMS_URLS: Tuple[str, ...] = (
+    "https://services.nationalmap.gov/arcgis/services/USGSNAIPPlus/MapServer/WmsServer",
+    "https://services.nationalmap.gov/arcgis/services/USGSNAIPPlus/MapServer/WMSServer",
+    "https://basemap.nationalmap.gov/arcgis/services/USGSNAIPPlus/MapServer/WmsServer",
+)
 NAIP_LAYER_NAME = "0"
 NAIP_IMAGE_FORMAT = "image/jpeg"
 NAIP_PIXELS_PER_DEGREE = 36000
@@ -332,36 +336,57 @@ async def download_naip_area_tiles(
                     "HEIGHT": height,
                 }
 
-                try:
-                    response = await client.get(NAIP_WMS_URL, params=params)
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail = _short_error_detail(exc.response.text)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
-                    )
-                    logger.warning(
-                        "USGS NAIP imagery request failed with status %s: %s",
-                        exc.response.status_code,
-                        detail,
-                    )
-                    continue
-                except httpx.RequestError as exc:
-                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
-                    logger.warning("USGS NAIP imagery request error: %s", exc)
-                    continue
+                response: httpx.Response | None = None
+                last_error: str | None = None
 
-                if not _is_image_response(response):
-                    content_type = response.headers.get("Content-Type", "unknown")
-                    detail = _short_error_detail(response.text)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
-                    )
-                    logger.warning(
-                        "USGS NAIP imagery request returned non-image payload (%s): %s",
-                        content_type,
-                        detail,
-                    )
+                for endpoint in NAIP_WMS_URLS:
+                    try:
+                        candidate = await client.get(endpoint, params=params)
+                        candidate.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        detail = _short_error_detail(exc.response.text)
+                        last_error = f"{exc.response.status_code} {detail} (endpoint {endpoint})"
+                        logger.warning(
+                            "USGS NAIP imagery request failed with status %s from %s: %s",
+                            exc.response.status_code,
+                            endpoint,
+                            detail,
+                        )
+                        continue
+                    except httpx.RequestError as exc:
+                        last_error = f"{exc} (endpoint {endpoint})"
+                        logger.warning(
+                            "USGS NAIP imagery request error from %s: %s",
+                            endpoint,
+                            exc,
+                        )
+                        continue
+
+                    if not _is_image_response(candidate):
+                        content_type = candidate.headers.get("Content-Type", "unknown")
+                        detail = _short_error_detail(candidate.text)
+                        last_error = (
+                            f"unexpected payload ({content_type}) from {endpoint}: {detail}"
+                        )
+                        logger.warning(
+                            "USGS NAIP imagery request returned non-image payload (%s) from %s: %s",
+                            content_type,
+                            endpoint,
+                            detail,
+                        )
+                        continue
+
+                    response = candidate
+                    if endpoint != NAIP_WMS_URLS[0]:
+                        logger.info(
+                            "USGS NAIP imagery request succeeded using fallback endpoint %s",
+                            endpoint,
+                        )
+                    break
+
+                if response is None:
+                    error_message = last_error or "no NAIP endpoints available"
+                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {error_message}")
                     continue
 
                 filename = _tile_filename(
