@@ -8,6 +8,9 @@ from typing import List, Tuple
 
 import httpx
 
+DEMO_API_KEY = "DEMO_KEY"
+DEMO_KEY_TILE_LIMIT = 2
+
 logger = logging.getLogger(__name__)
 
 NASA_EARTH_IMAGERY_URL = "https://api.nasa.gov/planetary/earth/imagery"
@@ -65,7 +68,15 @@ async def download_nasa_area_tiles(
     )
 
     total_tiles = len(lat_centers) * len(lon_centers)
-    if total_tiles > MAX_TILES_PER_RUN:
+
+    max_tiles_for_key = _max_tiles_for_api_key(api_key)
+    if total_tiles > max_tiles_for_key:
+        if _is_demo_key(api_key):
+            raise ValueError(
+                "The NASA DEMO_KEY may only be used for two imagery requests at a time. "
+                f"The requested area would require {total_tiles} tiles. Reduce the coverage or "
+                "use your own NASA API key."
+            )
         raise ValueError(
             "Requested area requires "
             f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
@@ -190,3 +201,13 @@ def _short_error_detail(detail: str) -> str:
     if len(detail) > 160:
         return f"{detail[:157]}..."
     return detail or "(no detail)"
+
+
+def _max_tiles_for_api_key(api_key: str) -> int:
+    if _is_demo_key(api_key):
+        return min(MAX_TILES_PER_RUN, DEMO_KEY_TILE_LIMIT)
+    return MAX_TILES_PER_RUN
+
+
+def _is_demo_key(api_key: str) -> bool:
+    return (api_key or "").strip().upper() == DEMO_API_KEY
