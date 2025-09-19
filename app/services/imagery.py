@@ -340,9 +340,17 @@ async def download_naip_area_tiles(
                 }
 
                 request_attempts = [
-                    ("1.3.0", "CRS", bbox_lon_lat, "lon-lat"),
+                    # WMS 1.3.0 swaps the axis order for EPSG:4326 compared to the legacy
+                    # specification, however some ArcGIS deployments still honour the older
+                    # behaviour. Try the standards-compliant latitude/longitude order first,
+                    # then fall back to the alternate ordering before attempting version 1.1.1.
                     ("1.3.0", "CRS", bbox_lat_lon, "lat-lon"),
+                    ("1.3.0", "CRS", bbox_lon_lat, "lon-lat"),
+                    # A number of NAIP endpoints erroneously expect latitude/longitude even
+                    # when negotiating WMS 1.1.1 responses. Include both permutations so the
+                    # downloader can gracefully recover instead of failing with a 400 error.
                     ("1.1.1", "SRS", bbox_lon_lat, "lon-lat"),
+                    ("1.1.1", "SRS", bbox_lat_lon, "lat-lon"),
                 ]
 
                 response: httpx.Response | None = None
