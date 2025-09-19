@@ -45,7 +45,9 @@ Key features:
    use the automatic area scan form to request imagery for a latitude/longitude bounding box. The
    app downloads tiles from NASA's Global Imagery Browse Services (GIBS), analyzes each tile, and
    stores the results so you can revisit previous detections. Each scan is limited to 50 GIBS
-   requests to prevent accidental overload of the service.
+   requests to prevent accidental overload of the service, and every tile is requested at a minimum
+   of 256×256 pixels so the vision models have enough detail to work with even for small bounding
+   boxes.
 
 Uploaded imagery is stored under `data/uploads`, and analysis metadata is tracked in the
 `data/satellite_scans.db` SQLite database.
