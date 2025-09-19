@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Satellite Infrastructure Scanner</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Satellite Infrastructure Scanner</h1>
+      <p>
+        Upload high-resolution satellite imagery and let the system look for unusual
+        infrastructure. The analyzer combines image captioning, open-ended visual question
+        answering, and general-purpose object detection to surface noteworthy findings.
+      </p>
+    </header>
+
+    {% if message %}
+    <div class="flash">{{ message }}</div>
+    {% endif %}
+
+    <section class="upload">
+      <form action="/analyze" method="post" enctype="multipart/form-data">
+        <label for="image">Satellite image</label>
+        <input id="image" name="image" type="file" accept="image/*" required />
+
+        <label for="prompt">Analysis prompt</label>
+        <textarea id="prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
+
+        <button type="submit">Analyze image</button>
+      </form>
+    </section>
+
+    <section class="results">
+      <h2>Analysis history</h2>
+      {% if results %}
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Image</th>
+            <th>Caption</th>
+            <th>Unusual findings</th>
+            <th>Detected objects</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for result in results %}
+          <tr>
+            <td>{{ result.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+            <td>
+              <a href="/data/uploads/{{ result.image_filename }}" target="_blank">
+                {{ result.image_filename }}
+              </a>
+            </td>
+            <td>{{ result.caption }}</td>
+            <td>{{ result.unusual_summary }}</td>
+            <td>
+              {% if result.detections %}
+              <ul>
+                {% for detection in result.detections %}
+                <li>
+                  <strong>{{ detection["object"] }}</strong>
+                  (confidence {{ '%.2f'|format(detection["confidence"]) }})
+                  {% set answers = detection.get('answers') %}
+                  {% if answers %}
+                  <div class="meta">Model answers: {{ answers|join(', ') }}</div>
+                  {% endif %}
+                  {% set box = detection.get('box') %}
+                  {% if box %}
+                  <div class="meta">
+                    Bounding box: xmin {{ box["xmin"] }}, ymin {{ box["ymin"] }}, xmax
+                    {{ box["xmax"] }}, ymax {{ box["ymax"] }}
+                  </div>
+                  {% endif %}
+                </li>
+                {% endfor %}
+              </ul>
+              {% else %}
+              <em>No objects detected above the confidence threshold</em>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p>No analyses have been recorded yet. Upload your first satellite scene to begin.</p>
+      {% endif %}
+    </section>
+  </body>
+</html>

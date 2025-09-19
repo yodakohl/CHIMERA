@@ -1,0 +1,155 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: #0b1220;
+  color: #e6edf7;
+}
+
+body {
+  margin: 0 auto;
+  max-width: 960px;
+  padding: 2rem 1.5rem 4rem;
+  line-height: 1.6;
+}
+
+header {
+  margin-bottom: 2rem;
+}
+
+h1 {
+  margin-bottom: 0.25rem;
+}
+
+.upload form {
+  display: grid;
+  gap: 1rem;
+  padding: 1.5rem;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  margin-bottom: 2.5rem;
+}
+
+.upload label {
+  font-weight: 600;
+}
+
+.upload button {
+  padding: 0.75rem 1.5rem;
+  border-radius: 999px;
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(120deg, #5f89ff, #a855f7);
+  color: white;
+  font-weight: 600;
+  transition: transform 0.2s ease;
+}
+
+.upload button:hover {
+  transform: translateY(-1px);
+}
+
+.flash {
+  background-color: rgba(88, 166, 255, 0.25);
+  padding: 1rem 1.5rem;
+  border-radius: 12px;
+  margin-bottom: 1.5rem;
+}
+
+.results table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: rgba(255, 255, 255, 0.03);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.results th,
+.results td {
+  padding: 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  vertical-align: top;
+}
+
+.results th {
+  text-align: left;
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.results tbody tr:hover {
+  background-color: rgba(255, 255, 255, 0.04);
+}
+
+.results ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+}
+
+.results li {
+  margin-bottom: 0.75rem;
+}
+
+.results .meta {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+@media (max-width: 768px) {
+  body {
+    padding: 1.5rem 1rem 3rem;
+  }
+
+  .results table,
+  .results thead,
+  .results tbody,
+  .results th,
+  .results td,
+  .results tr {
+    display: block;
+  }
+
+  .results tr {
+    margin-bottom: 1.5rem;
+  }
+
+  .results th {
+    position: absolute;
+    left: -9999px;
+    top: -9999px;
+  }
+
+  .results td {
+    border: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    position: relative;
+    padding-left: 50%;
+  }
+
+  .results td::before {
+    position: absolute;
+    left: 1rem;
+    width: 45%;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+
+  .results td:nth-of-type(1)::before {
+    content: "Timestamp";
+  }
+
+  .results td:nth-of-type(2)::before {
+    content: "Image";
+  }
+
+  .results td:nth-of-type(3)::before {
+    content: "Caption";
+  }
+
+  .results td:nth-of-type(4)::before {
+    content: "Unusual";
+  }
+
+  .results td:nth-of-type(5)::before {
+    content: "Detected objects";
+  }
+}

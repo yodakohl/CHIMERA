@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.db
+*.db-journal
+.env
+.venv/
+.env.local
+.pytest_cache/
+.ipynb_checkpoints/
+data/uploads/
