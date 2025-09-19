@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +15,7 @@ from sqlmodel import Session, select
 from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult
 from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
-from .services.imagery import download_nasa_area_tiles
+from .services.imagery import download_gibs_area_tiles
 
 app = FastAPI(title="Satellite Infrastructure Scanner", version="0.1.0")
 
@@ -26,15 +25,13 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 AREA_SCAN_DIR = UPLOAD_DIR / "area_scans"
 AREA_SCAN_DIR.mkdir(parents=True, exist_ok=True)
 
-NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
-
 DEFAULT_SCAN_BOUNDS = {
     "north": 37.83,
     "south": 37.73,
     "west": -122.52,
     "east": -122.47,
 }
-# A 0.05° tile size keeps the DEMO_KEY requests at two tiles for the default bounding box.
+# A 0.05° tile size yields a compact 2x1 grid for the default bounding box.
 DEFAULT_SCAN_TILE_SIZE = 0.05
 DEFAULT_SCAN_DATE: str | None = None
 
@@ -91,24 +88,21 @@ async def scan_area(
     tile_size: float = Form(DEFAULT_SCAN_TILE_SIZE),
     prompt: str = Form(DEFAULT_PROMPT),
     date: str | None = Form(DEFAULT_SCAN_DATE),
-    api_key: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
     analyzer = get_analyzer()
     area_dir = AREA_SCAN_DIR / datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
-    selected_api_key = (api_key or "").strip() or NASA_API_KEY
     requested_date = (date or "").strip() or None
 
     try:
-        tiles, download_failures = await download_nasa_area_tiles(
+        tiles, download_failures = await download_gibs_area_tiles(
             north=north,
             south=south,
             east=east,
             west=west,
             dim=tile_size,
             output_dir=area_dir,
-            api_key=selected_api_key,
             date=requested_date,
         )
     except ValueError as exc:
@@ -129,7 +123,7 @@ async def scan_area(
         if download_failures:
             failures_count = len(download_failures)
             failure_plural = "s" if failures_count != 1 else ""
-            base_message += f" {failures_count} NASA request{failure_plural} failed."
+            base_message += f" {failures_count} GIBS request{failure_plural} failed."
             first_failure = download_failures[0]
             base_message += f" First failure detail: {first_failure}."
         return _render_home(request, session, message=base_message)
@@ -172,7 +166,7 @@ async def scan_area(
     summary_parts: List[str] = []
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
-        summary_parts.append(f"Analyzed {processed_count} NASA tile{processed_plural}.")
+        summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
     download_failures_count = len(download_failures)
     if download_failures_count:
         download_plural = "s" if download_failures_count != 1 else ""
