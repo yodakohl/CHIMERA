@@ -21,7 +21,7 @@
     {% endif %}
 
     <section class="upload">
-      <form action="/analyze" method="post" enctype="multipart/form-data">
+      <form class="form-card" action="/analyze" method="post" enctype="multipart/form-data">
         <label for="image">Satellite image</label>
         <input id="image" name="image" type="file" accept="image/*" required />
 
@@ -29,6 +29,97 @@
         <textarea id="prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
 
         <button type="submit">Analyze image</button>
+      </form>
+    </section>
+
+    <section class="area">
+      <h2>Automatic area scan</h2>
+      <p>
+        Request imagery for a latitude/longitude bounding box and the scanner will automatically
+        download tiles from the free NASA Earth imagery API before running the analysis pipeline on
+        each tile.
+      </p>
+      <form class="form-card" action="/scan-area" method="post">
+        <div class="form-grid">
+          <div class="field">
+            <label for="north">North latitude</label>
+            <input
+              id="north"
+              name="north"
+              type="number"
+              step="0.0001"
+              min="-90"
+              max="90"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="south">South latitude</label>
+            <input
+              id="south"
+              name="south"
+              type="number"
+              step="0.0001"
+              min="-90"
+              max="90"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="west">West longitude</label>
+            <input
+              id="west"
+              name="west"
+              type="number"
+              step="0.0001"
+              min="-180"
+              max="180"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="east">East longitude</label>
+            <input
+              id="east"
+              name="east"
+              type="number"
+              step="0.0001"
+              min="-180"
+              max="180"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="tile-size">Tile size (degrees)</label>
+            <input
+              id="tile-size"
+              name="tile_size"
+              type="number"
+              step="0.01"
+              min="0.01"
+              max="0.5"
+              value="0.05"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="date">Acquisition date (optional)</label>
+            <input id="date" name="date" type="date" />
+          </div>
+          <div class="field">
+            <label for="api-key">NASA API key (optional)</label>
+            <input id="api-key" name="api_key" type="text" placeholder="Defaults to DEMO_KEY" />
+          </div>
+        </div>
+        <p class="hint">
+          Large areas may require increasing the tile size to stay under the public NASA DEMO_KEY
+          rate limits. Provide your own API key for higher throughput.
+        </p>
+
+        <label for="area-prompt">Analysis prompt</label>
+        <textarea id="area-prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
+
+        <button type="submit">Scan area</button>
       </form>
     </section>
 
