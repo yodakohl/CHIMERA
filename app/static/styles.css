@@ -20,7 +20,7 @@ h1 {
   margin-bottom: 0.25rem;
 }
 
-.upload form {
+.form-card {
   display: grid;
   gap: 1rem;
   padding: 1.5rem;
@@ -29,11 +29,27 @@ h1 {
   margin-bottom: 2.5rem;
 }
 
-.upload label {
+.form-card input,
+.form-card textarea {
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background-color: rgba(11, 18, 32, 0.7);
+  color: inherit;
+  box-sizing: border-box;
+}
+
+.form-card input:focus,
+.form-card textarea:focus {
+  outline: 2px solid rgba(95, 137, 255, 0.6);
+  outline-offset: 2px;
+}
+
+.form-card label {
   font-weight: 600;
 }
 
-.upload button {
+.form-card button {
   padding: 0.75rem 1.5rem;
   border-radius: 999px;
   border: none;
@@ -44,8 +60,31 @@ h1 {
   transition: transform 0.2s ease;
 }
 
-.upload button:hover {
+.form-card button:hover {
   transform: translateY(-1px);
+}
+
+.form-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  margin-bottom: 1rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.form-card .hint {
+  font-size: 0.9rem;
+  opacity: 0.8;
+  margin: 0;
+}
+
+.area {
+  margin-bottom: 2.5rem;
 }
 
 .flash {
