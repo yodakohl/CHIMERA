@@ -16,8 +16,8 @@ GIBS_WMS_URL = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
 GIBS_DEFAULT_LAYER = "VIIRS_SNPP_CorrectedReflectance_TrueColor"
 GIBS_IMAGE_FORMAT = "image/png"
 GIBS_PIXELS_PER_DEGREE = 4096
-GIBS_MIN_TILE_PIXELS = 1024
-GIBS_MAX_TILE_PIXELS = 2048
+GIBS_MIN_TILE_PIXELS = 2048
+GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
 
 RECENT_LOOKBACK_DAYS = 1
@@ -45,6 +45,7 @@ class AreaTile:
     lon: float
     path: Path
     source_url: str
+    pixel_size: int
 
 
 async def download_gibs_area_tiles(
@@ -160,6 +161,7 @@ async def download_gibs_area_tiles(
                         lon=lon,
                         path=tile_path,
                         source_url=str(response.url),
+                        pixel_size=tile_pixels,
                     )
                 )
 
