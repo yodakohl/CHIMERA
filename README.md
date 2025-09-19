@@ -47,7 +47,9 @@ Key features:
    stores the results so you can revisit previous detections. Each scan is limited to 50 GIBS
    requests to prevent accidental overload of the service, and every tile is requested at a minimum
    of 256×256 pixels so the vision models have enough detail to work with even for small bounding
-   boxes.
+   boxes. When the default VIIRS true-color layer is too blocky for object recognition, the
+   downloader automatically retries with the higher resolution Landsat WELD mosaic to deliver
+   ~30 m/pixel imagery.
 
 Uploaded imagery is stored under `data/uploads`, and analysis metadata is tracked in the
 `data/satellite_scans.db` SQLite database.

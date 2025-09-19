@@ -16,8 +16,7 @@ from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult
 from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
 from .services.imagery import (
-    GIBS_MIN_TILE_PIXELS,
-    GIBS_PIXELS_PER_DEGREE,
+    GIBS_DEFAULT_LAYER,
     MAX_DIM,
     MIN_DIM,
     download_gibs_area_tiles,
@@ -172,20 +171,33 @@ async def scan_area(
     summary_parts: List[str] = []
     tile_resolution = tiles[0].pixel_size if tiles else None
     tile_span = tiles[0].degree_size if tiles else None
+    tile_layer = tiles[0].layer if tiles else None
+    native_tile_span = tiles[0].native_dim if tiles else None
     low_detail_remaining = any(tile.low_detail for tile in tiles)
-    native_tile_span = max(MIN_DIM, GIBS_MIN_TILE_PIXELS / GIBS_PIXELS_PER_DEGREE)
-    base_span = max(tile_size, native_tile_span)
+    base_span = max(tile_size, native_tile_span) if native_tile_span is not None else tile_size
+    approx_resolution_m = (
+        111_320 / tiles[0].pixels_per_degree if tiles and tiles[0].pixels_per_degree else None
+    )
+    layer_description = tiles[0].layer_description if tiles else None
+    detail_ratios = [tile.detail_ratio for tile in tiles if tile.detail_ratio is not None]
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
         summary_parts.append(f"Analyzed {processed_count} GIBS tile{processed_plural}.")
+    if tile_layer:
+        description = layer_description or tile_layer
+        summary_parts.append(f"Imagery layer: {description}.")
+        if tile_layer != GIBS_DEFAULT_LAYER:
+            summary_parts.append(
+                "Switched to a higher-resolution NASA mosaic after the default VIIRS imagery appeared too blocky."
+            )
     if tile_span is not None:
         summary_parts.append(f"Tile span: {tile_span:.3f}°.")
-        if abs(tile_span - tile_size) > 1e-6:
+        if abs(tile_span - tile_size) > 1e-6 and native_tile_span is not None:
             if tile_span > base_span + 1e-9:
                 summary_parts.append(
                     "Tiles were merged into larger requests after detecting blocky imagery."
                 )
-            else:
+            elif tile_span > tile_size:
                 summary_parts.append(
                     "Tile span increased from requested "
                     f"{tile_size:.3f}° to {tile_span:.3f}° to match the layer's "
@@ -193,6 +205,15 @@ async def scan_area(
                 )
     if tile_resolution:
         summary_parts.append(f"Tile resolution: {tile_resolution}px per side.")
+    if approx_resolution_m is not None:
+        summary_parts.append(
+            f"Approximate source resolution: ~{approx_resolution_m:.0f} m per pixel."
+        )
+    if detail_ratios:
+        avg_ratio = sum(detail_ratios) / len(detail_ratios)
+        summary_parts.append(
+            f"Average neighbor similarity: {avg_ratio:.3f} (lower indicates higher detail)."
+        )
     if low_detail_remaining:
         if tile_span is not None and tile_span >= MAX_DIM - 1e-9:
             summary_parts.append(
