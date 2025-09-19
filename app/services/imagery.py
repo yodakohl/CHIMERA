@@ -321,7 +321,15 @@ async def download_naip_area_tiles(
                 lon_span = max(east_bound - west_bound, MIN_DIM)
                 width = _naip_tile_pixels(lon_span)
                 height = _naip_tile_pixels(lat_span)
-                bbox = f"{south_bound:.6f},{west_bound:.6f},{north_bound:.6f},{east_bound:.6f}"
+                # ArcGIS-based WMS endpoints (including USGS NAIP) expect the axis order to
+                # remain longitude, latitude even when using the WMS 1.3.0 ``CRS`` parameter.
+                # When we send the more standards-compliant latitude/longitude ordering used
+                # elsewhere in the downloader the service returns a 400 response for locations
+                # whose longitude falls outside the ``[-90, 90]`` latitude domain (for example
+                # the Pacific Northwest).  Reversing the order to west/south/east/north matches
+                # the behaviour of the ArcGIS clients and restores access to NAIP tiles across
+                # the continental United States.
+                bbox = f"{west_bound:.6f},{south_bound:.6f},{east_bound:.6f},{north_bound:.6f}"
 
                 params = {
                     "SERVICE": "WMS",
