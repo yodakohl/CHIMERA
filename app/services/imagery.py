@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from datetime import date as dt_date, datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import httpx
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +19,21 @@ GIBS_TILE_WIDTH = 512
 GIBS_TILE_HEIGHT = 512
 GIBS_DEFAULT_TIME = "default"
 
+RECENT_LOOKBACK_DAYS = 1
+FALLBACK_LOOKBACK_DAYS = 3
+
 MIN_DIM = 0.01
 MAX_DIM = 0.5
 MAX_TILES_PER_RUN = 50
 REQUEST_TIMEOUT = httpx.Timeout(60.0)
+
+_CAPABILITIES_PARAMS = {
+    "SERVICE": "WMS",
+    "REQUEST": "GetCapabilities",
+    "VERSION": "1.3.0",
+}
+
+_layer_latest_date_cache: Dict[str, str] = {}
 
 
 @dataclass
@@ -81,9 +94,8 @@ async def download_gibs_area_tiles(
     tiles: List[AreaTile] = []
     failures: List[str] = []
 
-    time_param = date or GIBS_DEFAULT_TIME
-
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        time_param = await _resolve_time_parameter(client, date)
         for lat in lat_centers:
             for lon in lon_centers:
                 south, north, west_bound, east_bound = _tile_bounds(lat, lon, dim)
@@ -99,8 +111,10 @@ async def download_gibs_area_tiles(
                     "HEIGHT": GIBS_TILE_HEIGHT,
                     "CRS": "EPSG:4326",
                     "BBOX": bbox,
-                    "TIME": time_param,
                 }
+
+                if time_param:
+                    params["TIME"] = time_param
 
                 try:
                     response = await client.get(GIBS_WMS_URL, params=params)
@@ -147,6 +161,146 @@ async def download_gibs_area_tiles(
                 )
 
     return tiles, failures
+
+
+async def _resolve_time_parameter(
+    client: httpx.AsyncClient, requested_date: str | None
+) -> str:
+    if requested_date:
+        return requested_date
+
+    cached_date = _layer_latest_date_cache.get(GIBS_DEFAULT_LAYER)
+    if cached_date:
+        return cached_date
+
+    discovered_date = await _fetch_latest_available_date(client, GIBS_DEFAULT_LAYER)
+    if discovered_date:
+        _layer_latest_date_cache[GIBS_DEFAULT_LAYER] = discovered_date
+        return discovered_date
+
+    fallback = _fallback_date_string()
+    logger.warning(
+        "Falling back to %s for GIBS layer %s due to missing capabilities data.",
+        fallback,
+        GIBS_DEFAULT_LAYER,
+    )
+    return fallback
+
+
+async def _fetch_latest_available_date(
+    client: httpx.AsyncClient, layer: str
+) -> str | None:
+    try:
+        response = await client.get(GIBS_WMS_URL, params=_CAPABILITIES_PARAMS)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("Failed to fetch GIBS capabilities: %s", exc)
+        return None
+
+    try:
+        root = ET.fromstring(response.text)
+    except ET.ParseError as exc:
+        logger.warning("Failed to parse GIBS capabilities XML: %s", exc)
+        return None
+
+    dimension = _find_time_dimension(root, layer)
+    if dimension is None:
+        return None
+
+    dimension_text = (dimension.text or "").strip()
+    reference_date = _reference_date()
+
+    latest = _latest_date_from_dimension(dimension_text, reference_date)
+    if latest is None:
+        latest = _latest_date_from_dimension(dimension_text, _current_utc_date())
+
+    if latest is None:
+        default_attr = dimension.attrib.get("default")
+        default_date = _safe_parse_date(default_attr)
+        if default_date:
+            today = _current_utc_date()
+            if default_date > today:
+                default_date = today
+            latest = default_date
+
+    if latest is None:
+        return None
+
+    return latest.isoformat()
+
+
+def _find_time_dimension(root: ET.Element, layer_name: str) -> ET.Element | None:
+    namespaces = {"wms": "http://www.opengis.net/wms"}
+    for layer in root.findall(".//wms:Layer", namespaces):
+        name_element = layer.find("wms:Name", namespaces)
+        if name_element is None:
+            continue
+        if (name_element.text or "").strip() != layer_name:
+            continue
+        dimension = layer.find("wms:Dimension[@name='time']", namespaces)
+        if dimension is not None:
+            return dimension
+    return None
+
+
+def _latest_date_from_dimension(dimension_text: str, limit: dt_date) -> dt_date | None:
+    if not dimension_text:
+        return None
+
+    latest: dt_date | None = None
+    for chunk in dimension_text.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        parts = token.split("/")
+        if len(parts) == 1:
+            candidate = _safe_parse_date(parts[0])
+            if candidate is None or candidate > limit:
+                continue
+        else:
+            start = _safe_parse_date(parts[0])
+            end = _safe_parse_date(parts[1]) if len(parts) > 1 else None
+            if start and start > limit:
+                continue
+            if end is None or end > limit:
+                end = limit
+            if start and end < start:
+                end = start
+            candidate = end
+        if candidate is None:
+            continue
+        if candidate > limit:
+            candidate = limit
+        if latest is None or candidate > latest:
+            latest = candidate
+
+    return latest
+
+
+def _safe_parse_date(token: str | None) -> dt_date | None:
+    if not token:
+        return None
+    token = token.strip()
+    if not token:
+        return None
+    if len(token) >= 10:
+        token = token[:10]
+    try:
+        return dt_date.fromisoformat(token)
+    except ValueError:
+        return None
+
+
+def _current_utc_date() -> dt_date:
+    return datetime.utcnow().date()
+
+
+def _reference_date() -> dt_date:
+    return _current_utc_date() - timedelta(days=RECENT_LOOKBACK_DAYS)
+
+
+def _fallback_date_string() -> str:
+    return (_current_utc_date() - timedelta(days=FALLBACK_LOOKBACK_DAYS)).isoformat()
 
 
 def _validate_bounds(*, north: float, south: float, east: float, west: float) -> None:
