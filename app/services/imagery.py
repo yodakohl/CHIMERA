@@ -44,6 +44,33 @@ _CAPABILITIES_PARAMS = {
     "VERSION": "1.3.0",
 }
 
+@dataclass(frozen=True)
+class GibsLayerConfig:
+    """Configuration describing the characteristics of a NASA GIBS imagery layer."""
+
+    name: str
+    pixels_per_degree: int
+    min_tile_pixels: int = GIBS_MIN_TILE_PIXELS
+    max_tile_pixels: int = GIBS_MAX_TILE_PIXELS
+    description: str | None = None
+
+
+DEFAULT_LAYER = GibsLayerConfig(
+    name=GIBS_DEFAULT_LAYER,
+    pixels_per_degree=GIBS_PIXELS_PER_DEGREE,
+    description="Suomi NPP VIIRS true color (~1 km)",
+)
+
+# Landsat WELD mosaics provide ~30 m per pixel coverage that is far more suitable for
+# object recognition models when recent imagery is not required.
+HIGH_RES_LAYER = GibsLayerConfig(
+    name="Landsat_WELD_CorrectedReflectance_TrueColor_Global_Monthly",
+    pixels_per_degree=3600,
+    description="Landsat WELD true color mosaic (~30 m)",
+)
+
+LAYER_SEQUENCE: Tuple[GibsLayerConfig, ...] = (DEFAULT_LAYER, HIGH_RES_LAYER)
+
 _layer_latest_date_cache: Dict[str, str] = {}
 
 
@@ -57,7 +84,12 @@ class AreaTile:
     source_url: str
     pixel_size: int
     degree_size: float
+    layer: str
+    native_dim: float
+    pixels_per_degree: int
     low_detail: bool = field(default=False)
+    detail_ratio: float | None = field(default=None)
+    layer_description: str | None = field(default=None)
 
 
 async def download_gibs_area_tiles(
@@ -84,74 +116,165 @@ async def download_gibs_area_tiles(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    requested_dim = dim
-    dim = max(dim, _minimum_native_tile_dim())
-    if dim > requested_dim + 1e-9:
-        logger.info(
-            "Requested tile size %.3f° is below the native resolution of %s; using %.3f° tiles instead.",
-            requested_dim,
-            GIBS_DEFAULT_LAYER,
-            dim,
-        )
-
+    aggregated_failures: List[str] = []
+    best_attempt: Tuple[GibsLayerConfig, str | None, float] | None = None
     tiles: List[AreaTile] = []
-    failures: List[str] = []
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        time_param = await _resolve_time_parameter(client, date)
-
-        current_dim = dim
-        while True:
-            _clear_output_directory(output_dir)
-            attempt_tiles, attempt_failures = await _download_tiles_for_dim(
+        for index, layer in enumerate(LAYER_SEQUENCE):
+            time_param = await _resolve_time_parameter(client, date, layer)
+            attempt_tiles, attempt_failures, used_dim, low_detail_remaining, avg_ratio = await _download_with_adaptive_dim(
                 client=client,
+                layer=layer,
                 time_param=time_param,
                 north=north,
                 south=south,
                 east=east,
                 west=west,
-                dim=current_dim,
+                initial_dim=dim,
                 output_dir=output_dir,
                 date=date,
             )
 
-            tiles = attempt_tiles
-            failures = attempt_failures
+            aggregated_failures.extend(attempt_failures)
 
-            if not tiles:
-                break
-
-            needs_more_detail, detail_flags = _tiles_need_higher_resolution(tiles)
-
-            if not needs_more_detail or current_dim >= MAX_DIM:
-                for tile, flag in zip(tiles, detail_flags):
-                    tile.low_detail = flag
-                if needs_more_detail and current_dim >= MAX_DIM:
-                    logger.info(
-                        "GIBS tiles remain low detail after reaching the maximum tile size of %.3f°.",
-                        current_dim,
+            if attempt_tiles:
+                tiles = attempt_tiles
+                best_attempt = (layer, time_param, used_dim)
+                if avg_ratio is not None:
+                    logger.debug(
+                        "Average neighbor similarity for layer %s at %.3f° tiles: %.3f",
+                        layer.name,
+                        used_dim,
+                        avg_ratio,
                     )
-                break
+                if not low_detail_remaining:
+                    return tiles, aggregated_failures
 
-            new_dim = min(MAX_DIM, current_dim * 2)
-            if new_dim <= current_dim + 1e-9:
-                for tile, flag in zip(tiles, detail_flags):
-                    tile.low_detail = flag
-                break
+                next_layer = LAYER_SEQUENCE[index + 1] if index + 1 < len(LAYER_SEQUENCE) else None
+                if next_layer:
+                    logger.info(
+                        "Imagery from %s remains low detail; attempting higher resolution layer %s.",
+                        layer.name,
+                        next_layer.name,
+                    )
+                    continue
 
-            logger.info(
-                "Tiles downloaded at %.3f° appear low detail (neighboring pixels mostly identical). Retrying with %.3f° tiles.",
-                current_dim,
-                new_dim,
+                return tiles, aggregated_failures
+
+        # If we reach this point no layer produced acceptable detail. Re-download the
+        # best attempt so the output directory contains the final imagery.
+        if best_attempt is not None:
+            layer, time_param, used_dim = best_attempt
+            _clear_output_directory(output_dir)
+            tiles, retry_failures = await _download_tiles_for_dim(
+                client=client,
+                layer=layer,
+                time_param=time_param,
+                north=north,
+                south=south,
+                east=east,
+                west=west,
+                dim=used_dim,
+                output_dir=output_dir,
+                date=date,
             )
-            current_dim = new_dim
+            aggregated_failures.extend(retry_failures)
+            if tiles:
+                _, detail_flags, detail_scores = _tiles_need_higher_resolution(tiles)
+                for tile, flag, score in zip(tiles, detail_flags, detail_scores):
+                    tile.low_detail = flag
+                    tile.detail_ratio = score
 
-    return tiles, failures
+    return tiles, aggregated_failures
+
+
+async def _download_with_adaptive_dim(
+    *,
+    client: httpx.AsyncClient,
+    layer: GibsLayerConfig,
+    time_param: str | None,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    initial_dim: float,
+    output_dir: Path,
+    date: str | None,
+) -> Tuple[List[AreaTile], List[str], float, bool, float | None]:
+    requested_dim = initial_dim
+    native_dim = _minimum_native_tile_dim(layer)
+    dim = max(initial_dim, native_dim)
+    if dim > requested_dim + 1e-9:
+        logger.info(
+            "Requested tile size %.3f° is below the native resolution of %s (~%.3f°); using %.3f° tiles instead.",
+            requested_dim,
+            layer.name,
+            native_dim,
+            dim,
+        )
+
+    current_dim = dim
+    tiles: List[AreaTile] = []
+    failures: List[str] = []
+    avg_ratio: float | None = None
+
+    while True:
+        _clear_output_directory(output_dir)
+        tiles, failures = await _download_tiles_for_dim(
+            client=client,
+            layer=layer,
+            time_param=time_param,
+            north=north,
+            south=south,
+            east=east,
+            west=west,
+            dim=current_dim,
+            output_dir=output_dir,
+            date=date,
+        )
+
+        if not tiles:
+            return tiles, failures, current_dim, False, avg_ratio
+
+        needs_more_detail, detail_flags, detail_scores = _tiles_need_higher_resolution(tiles)
+        avg_ratio = None
+        if detail_scores:
+            avg_ratio = sum(detail_scores) / len(detail_scores)
+        for tile, flag, score in zip(tiles, detail_flags, detail_scores):
+            tile.low_detail = flag
+            tile.detail_ratio = score
+
+        if not needs_more_detail:
+            return tiles, failures, current_dim, False, avg_ratio
+
+        if current_dim >= MAX_DIM - 1e-9:
+            logger.info(
+                "Tiles from layer %s remain low detail after reaching the maximum tile size of %.3f°.",
+                layer.name,
+                current_dim,
+            )
+            return tiles, failures, current_dim, True, avg_ratio
+
+        new_dim = min(MAX_DIM, current_dim * 2)
+        if new_dim <= current_dim + 1e-9:
+            return tiles, failures, current_dim, True, avg_ratio
+
+        ratio_text = f"{avg_ratio:.3f}" if avg_ratio is not None else "unknown"
+        logger.info(
+            "Tiles downloaded from layer %s at %.3f° appear low detail (average neighbor similarity %s). Retrying with %.3f° tiles.",
+            layer.name,
+            current_dim,
+            ratio_text,
+            new_dim,
+        )
+        current_dim = new_dim
 
 
 async def _download_tiles_for_dim(
     *,
     client: httpx.AsyncClient,
+    layer: GibsLayerConfig,
     time_param: str | None,
     north: float,
     south: float,
@@ -186,7 +309,7 @@ async def _download_tiles_for_dim(
 
     tiles: List[AreaTile] = []
     failures: List[str] = []
-    tile_pixels = _tile_pixel_size(dim)
+    tile_pixels = _tile_pixel_size(dim, layer)
 
     for lat in lat_centers:
         for lon in lon_centers:
@@ -198,7 +321,7 @@ async def _download_tiles_for_dim(
                 "FORMAT": GIBS_IMAGE_FORMAT,
                 "VERSION": "1.3.0",
                 "STYLES": "",
-                "LAYERS": GIBS_DEFAULT_LAYER,
+                "LAYERS": layer.name,
                 "WIDTH": tile_pixels,
                 "HEIGHT": tile_pixels,
                 "CRS": "EPSG:4326",
@@ -252,6 +375,10 @@ async def _download_tiles_for_dim(
                     source_url=str(response.url),
                     pixel_size=pixel_size,
                     degree_size=dim,
+                    layer=layer.name,
+                    native_dim=_minimum_native_tile_dim(layer),
+                    pixels_per_degree=layer.pixels_per_degree,
+                    layer_description=layer.description,
                 )
             )
 
@@ -259,27 +386,34 @@ async def _download_tiles_for_dim(
 
 
 async def _resolve_time_parameter(
-    client: httpx.AsyncClient, requested_date: str | None
+    client: httpx.AsyncClient, requested_date: str | None, layer: GibsLayerConfig
 ) -> str:
     if requested_date:
         return requested_date
 
-    cached_date = _layer_latest_date_cache.get(GIBS_DEFAULT_LAYER)
+    cached_date = _layer_latest_date_cache.get(layer.name)
     if cached_date:
         return cached_date
 
-    discovered_date = await _fetch_latest_available_date(client, GIBS_DEFAULT_LAYER)
+    discovered_date = await _fetch_latest_available_date(client, layer.name)
     if discovered_date:
-        _layer_latest_date_cache[GIBS_DEFAULT_LAYER] = discovered_date
+        _layer_latest_date_cache[layer.name] = discovered_date
         return discovered_date
 
-    fallback = _fallback_date_string()
-    logger.warning(
-        "Falling back to %s for GIBS layer %s due to missing capabilities data.",
-        fallback,
-        GIBS_DEFAULT_LAYER,
+    if layer.name == GIBS_DEFAULT_LAYER:
+        fallback = _fallback_date_string()
+        logger.warning(
+            "Falling back to %s for GIBS layer %s due to missing capabilities data.",
+            fallback,
+            layer.name,
+        )
+        return fallback
+
+    logger.info(
+        "Layer %s does not advertise a usable time dimension; requesting default imagery without a TIME parameter.",
+        layer.name,
     )
-    return fallback
+    return None
 
 
 async def _fetch_latest_available_date(
@@ -471,30 +605,35 @@ def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, floa
     return south, north, west, east
 
 
-def _tiles_need_higher_resolution(tiles: Sequence[AreaTile]) -> Tuple[bool, List[bool]]:
+def _tiles_need_higher_resolution(
+    tiles: Sequence[AreaTile],
+) -> Tuple[bool, List[bool], List[float]]:
     if not tiles:
-        return False, []
+        return False, [], []
 
     low_detail_flags: List[bool] = []
+    detail_scores: List[float] = []
     low_detail_count = 0
     for tile in tiles:
-        is_low_detail = _tile_has_nearly_identical_neighbors(tile.path)
+        ratio = _tile_neighbor_similarity_ratio(tile.path)
+        detail_scores.append(ratio)
+        is_low_detail = ratio >= NEIGHBOR_IDENTICAL_THRESHOLD
         low_detail_flags.append(is_low_detail)
         if is_low_detail:
             low_detail_count += 1
 
     threshold = max(1, len(tiles) // 2)
     needs_more_detail = low_detail_count >= threshold
-    return needs_more_detail, low_detail_flags
+    return needs_more_detail, low_detail_flags, detail_scores
 
 
-def _tile_has_nearly_identical_neighbors(tile_path: Path) -> bool:
+def _tile_neighbor_similarity_ratio(tile_path: Path) -> float:
     try:
         with Image.open(tile_path) as image:
             image = image.convert("RGB")
             width, height = image.size
             if width < 2 or height < 2:
-                return True
+                return 1.0
 
             pixels = image.load()
             identical = 0
@@ -512,12 +651,11 @@ def _tile_has_nearly_identical_neighbors(tile_path: Path) -> bool:
                             identical += 1
 
             if comparisons == 0:
-                return True
+                return 1.0
 
-            ratio = identical / comparisons
-            return ratio >= NEIGHBOR_IDENTICAL_THRESHOLD
+            return identical / comparisons
     except Exception:
-        return False
+        return 0.0
 
 
 def _clear_output_directory(output_dir: Path) -> None:
@@ -536,12 +674,12 @@ def _clear_output_directory(output_dir: Path) -> None:
             logger.warning("Failed to remove temporary imagery file %s", entry)
 
 
-def _minimum_native_tile_dim() -> float:
-    native_min = GIBS_MIN_TILE_PIXELS / GIBS_PIXELS_PER_DEGREE
+def _minimum_native_tile_dim(layer: GibsLayerConfig) -> float:
+    native_min = layer.min_tile_pixels / layer.pixels_per_degree
     return max(MIN_DIM, native_min)
 
 
-def _tile_pixel_size(dim: float) -> int:
+def _tile_pixel_size(dim: float, layer: GibsLayerConfig) -> int:
     """Derive the pixel resolution for a GIBS tile based on the requested dimension.
 
     The computation respects the native resolution of the layer while ensuring that the
@@ -549,10 +687,12 @@ def _tile_pixel_size(dim: float) -> int:
     analysis models receive sufficiently detailed inputs.
     """
 
-    estimated_pixels = max(math.ceil(dim * GIBS_PIXELS_PER_DEGREE), GIBS_MIN_TILE_PIXELS)
+    estimated_pixels = max(
+        math.ceil(dim * layer.pixels_per_degree), layer.min_tile_pixels
+    )
     if estimated_pixels % 2:
         estimated_pixels += 1
-    estimated_pixels = min(estimated_pixels, GIBS_MAX_TILE_PIXELS)
+    estimated_pixels = min(estimated_pixels, layer.max_tile_pixels)
     return int(estimated_pixels)
 
 
