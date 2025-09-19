@@ -9,14 +9,19 @@ from typing import Dict, List, Tuple
 
 import httpx
 import xml.etree.ElementTree as ET
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 GIBS_WMS_URL = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
 GIBS_DEFAULT_LAYER = "VIIRS_SNPP_CorrectedReflectance_TrueColor"
 GIBS_IMAGE_FORMAT = "image/png"
-GIBS_PIXELS_PER_DEGREE = 4096
-GIBS_MIN_TILE_PIXELS = 2048
+# The VIIRS "best" layer provides roughly 1 km per pixel resolution which equates to
+# ~1024 pixels per degree at the equator. Requesting larger tiles simply produces
+# upscaled imagery without exposing additional detail, so we derive tile sizes from the
+# native resolution instead of forcing multi-thousand pixel requests.
+GIBS_PIXELS_PER_DEGREE = 1024
+GIBS_MIN_TILE_PIXELS = 8
 GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
 
@@ -155,13 +160,14 @@ async def download_gibs_area_tiles(
                 filename = _tile_filename(lat, lon, date)
                 tile_path = output_dir / filename
                 tile_path.write_bytes(response.content)
+                pixel_size = _actual_tile_size(tile_path, tile_pixels)
                 tiles.append(
                     AreaTile(
                         lat=lat,
                         lon=lon,
                         path=tile_path,
                         source_url=str(response.url),
-                        pixel_size=tile_pixels,
+                        pixel_size=pixel_size,
                     )
                 )
 
@@ -396,6 +402,21 @@ def _short_error_detail(detail: str) -> str:
     if len(detail) > 160:
         return f"{detail[:157]}..."
     return detail or "(no detail)"
+
+
+def _actual_tile_size(tile_path: Path, fallback: int) -> int:
+    """Inspect a downloaded tile to discover its true pixel dimension."""
+
+    try:
+        with Image.open(tile_path) as image:
+            width, height = image.size
+    except Exception:  # pragma: no cover - guard against corrupt downloads
+        return fallback
+
+    longest_edge = max(width or 0, height or 0)
+    if longest_edge <= 0:
+        return fallback
+    return int(longest_edge)
 
 
 def _is_image_response(response: httpx.Response) -> bool:
