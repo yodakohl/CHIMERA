@@ -5,9 +5,10 @@ import json
 import logging
 import re
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Dict, List
+from typing import AsyncIterator, Dict, List, Sequence, Tuple
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -52,6 +53,7 @@ DEFAULT_SCAN_DATE: str | None = None
 DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.MAPTILER_SATELLITE
 
 RECLASSIFY_STREAM_BATCH_SIZE = 32
+AREA_SCAN_ANALYSIS_BATCH_SIZE = 4
 
 
 PROVIDER_OPTIONS = [
@@ -187,6 +189,68 @@ async def _run_analysis(
     return await run_in_threadpool(analyzer.analyze, image_path, prompt)
 
 
+async def _run_analysis_batch(
+    analyzer, image_paths: Sequence[Path], prompt: str
+) -> List[Dict[str, object]]:
+    """Run analysis for multiple images using the analyzer's batch interface."""
+
+    return await run_in_threadpool(analyzer.analyze_many, image_paths, prompt)
+
+
+async def _analyze_tiles_with_fallback(
+    analyzer, tiles: Sequence[AreaTile], prompt: str
+) -> List[Tuple[Dict[str, object] | None, Exception | None]]:
+    """Evaluate *tiles* using batched analysis with per-tile fallback."""
+
+    if not tiles:
+        return []
+
+    image_paths = [tile.path for tile in tiles]
+
+    try:
+        batch_results = await _run_analysis_batch(analyzer, image_paths, prompt)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        logger.warning(
+            "Batched analysis failed for %d tiles; falling back to single-image evaluation: %s",
+            len(tiles),
+            exc,
+        )
+        batch_results = None
+
+    if isinstance(batch_results, tuple):
+        batch_results = list(batch_results)
+
+    results: List[Tuple[Dict[str, object] | None, Exception | None]] = []
+
+    if isinstance(batch_results, list) and len(batch_results) == len(tiles):
+        for tile, analysis in zip(tiles, batch_results):
+            if isinstance(analysis, dict):
+                results.append((analysis, None))
+                continue
+            try:
+                fallback_analysis = await _run_analysis(analyzer, tile.path, prompt)
+            except Exception as exc:  # pragma: no cover - analyzer failure
+                results.append((None, exc))
+            else:
+                results.append((fallback_analysis, None))
+    else:
+        if batch_results is not None:
+            logger.warning(
+                "Batched analysis returned %s results for %s tiles; evaluating individually.",
+                len(batch_results),
+                len(tiles),
+            )
+        for tile in tiles:
+            try:
+                analysis = await _run_analysis(analyzer, tile.path, prompt)
+            except Exception as exc:  # pragma: no cover - analyzer failure
+                results.append((None, exc))
+            else:
+                results.append((analysis, None))
+
+    return results
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
@@ -292,26 +356,44 @@ async def scan_area(
     processed_records: List[AnalysisResult] = []
     analysis_failures: List[str] = []
 
-    for tile in tiles:
-        try:
-            analysis = await _run_analysis(analyzer, tile.path, prompt)
-        except Exception as exc:  # pragma: no cover - model failure
-            logger.exception(
-                "Analyzer failed for tile at lat %s lon %s: %s", tile.lat, tile.lon, exc
-            )
-            analysis_failures.append(f"{tile.lat:.4f}, {tile.lon:.4f}")
-            tile.path.unlink(missing_ok=True)
-            continue
+    async def process_batch(batch_tiles: List[AreaTile]) -> None:
+        if not batch_tiles:
+            return
 
-        record = AnalysisResult(
-            image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
-            prompt=analysis["prompt"],
-            caption=analysis["caption"],
-            unusual_summary=analysis["unusual_summary"],
-            detection_payload=serialize_detections(analysis["detections"]),
-            created_at=datetime.utcnow(),
-        )
-        processed_records.append(record)
+        results = await _analyze_tiles_with_fallback(analyzer, batch_tiles, prompt)
+
+        for tile, (analysis, error) in zip(batch_tiles, results):
+            if error is not None or not isinstance(analysis, dict):
+                logger.error(
+                    "Analyzer failed for tile at lat %s lon %s: %s",
+                    tile.lat,
+                    tile.lon,
+                    error,
+                    exc_info=error,
+                )
+                analysis_failures.append(f"{tile.lat:.4f}, {tile.lon:.4f}")
+                tile.path.unlink(missing_ok=True)
+                continue
+
+            record = AnalysisResult(
+                image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
+                prompt=analysis["prompt"],
+                caption=analysis["caption"],
+                unusual_summary=analysis["unusual_summary"],
+                detection_payload=serialize_detections(analysis["detections"]),
+                created_at=datetime.utcnow(),
+            )
+            processed_records.append(record)
+
+    batch: List[AreaTile] = []
+    for tile in tiles:
+        batch.append(tile)
+        if len(batch) >= AREA_SCAN_ANALYSIS_BATCH_SIZE:
+            await process_batch(batch)
+            batch = []
+
+    if batch:
+        await process_batch(batch)
 
     for record in processed_records:
         session.add(record)
@@ -372,18 +454,32 @@ async def stream_scan_area(
     processed_count = 0
     download_failures: List[str] = []
     analysis_failures: List[str] = []
+    queued_count = 0
+
+    @dataclass
+    class PendingAnalysis:
+        tile: AreaTile
+        index: int
+        total: int | None
+        bounds: Dict[str, float]
+        span: float
+        provider_label: str
+        progress_label: str
+
+    analysis_queue: asyncio.Queue[PendingAnalysis | None] = asyncio.Queue()
 
     async def enqueue(event: str, data: Dict[str, object]) -> None:
         await events.put((event, data))
 
     async def handle_tile(tile: AreaTile) -> None:
-        nonlocal processed_count
+        nonlocal queued_count
         if controller.cancelled:
             raise ImageryCancellationError("Scan cancelled")
 
         raw_index = getattr(tile, "sequence_index", None)
         raw_total = getattr(tile, "total_tiles", None)
-        index = raw_index if isinstance(raw_index, int) and raw_index > 0 else processed_count + 1
+        queued_count += 1
+        index = raw_index if isinstance(raw_index, int) and raw_index > 0 else queued_count
         total_tiles_hint = raw_total if isinstance(raw_total, int) and raw_total > 0 else None
         progress_label = f"Tile {index}"
         if total_tiles_hint:
@@ -416,73 +512,131 @@ async def stream_scan_area(
             },
         )
 
-        try:
-            analysis = await _run_analysis(analyzer, tile.path, prompt)
-        except Exception as exc:  # pragma: no cover - model failure
-            logger.exception(
-                "Analyzer failed for %s at lat %s lon %s: %s",
-                progress_label,
-                tile.lat,
-                tile.lon,
-                exc,
-            )
-            failure_message = (
-                f"Analysis failed for {progress_label} at {tile.lat:.4f}, {tile.lon:.4f}"
-            )
-            analysis_failures.append(failure_message)
-            await enqueue(
-                "analysis-failed",
-                {
-                    "message": failure_message,
-                    "lat": tile.lat,
-                    "lon": tile.lon,
-                    "bounds": bounds,
-                    "degree_size": span,
-                    "index": index,
-                    "total": total_tiles_hint,
-                },
-            )
-            tile.path.unlink(missing_ok=True)
+        pending = PendingAnalysis(
+            tile=tile,
+            index=index,
+            total=total_tiles_hint,
+            bounds=bounds,
+            span=span,
+            provider_label=provider_for_message,
+            progress_label=progress_label,
+        )
+        await analysis_queue.put(pending)
+
+    async def process_analysis_batch(batch_items: List[PendingAnalysis]) -> None:
+        nonlocal processed_count
+        if not batch_items or controller.cancelled:
             return
 
-        detections = analysis.get("detections", [])
-        record = AnalysisResult(
-            image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
-            prompt=analysis["prompt"],
-            caption=analysis["caption"],
-            unusual_summary=analysis["unusual_summary"],
-            detection_payload=serialize_detections(detections),
-            created_at=datetime.utcnow(),
-        )
-        session.add(record)
-        session.commit()
+        tiles_for_batch = [item.tile for item in batch_items]
+        results = await _analyze_tiles_with_fallback(analyzer, tiles_for_batch, prompt)
 
-        processed_count += 1
-        image_relative = str(tile.path.relative_to(UPLOAD_DIR))
-        logger.info(
-            "%s: analysis complete (%d detections).",
-            progress_label,
-            len(detections),
-        )
-        await enqueue(
-            "tile",
-            {
-                "index": index,
-                "total": total_tiles_hint,
-                "lat": tile.lat,
-                "lon": tile.lon,
-                "caption": analysis["caption"],
-                "unusual_summary": analysis["unusual_summary"],
-                "detections": detections,
-                "image": f"/data/uploads/{image_relative}",
-                "timestamp": record.created_at.isoformat(),
-                "provider_label": provider_for_message,
-                "bounds": bounds,
-                "degree_size": span,
-                "low_detail": tile.low_detail,
-                "detail_ratio": tile.detail_ratio,
-            },
-        )
+        for pending, (analysis, error) in zip(batch_items, results):
+            tile = pending.tile
+            if controller.cancelled:
+                break
+            if error is not None or not isinstance(analysis, dict):
+                logger.error(
+                    "Analyzer failed for %s at lat %s lon %s: %s",
+                    pending.progress_label,
+                    tile.lat,
+                    tile.lon,
+                    error,
+                    exc_info=error,
+                )
+                failure_message = (
+                    f"Analysis failed for {pending.progress_label} at {tile.lat:.4f}, {tile.lon:.4f}"
+                )
+                analysis_failures.append(failure_message)
+                await enqueue(
+                    "analysis-failed",
+                    {
+                        "message": failure_message,
+                        "lat": tile.lat,
+                        "lon": tile.lon,
+                        "bounds": pending.bounds,
+                        "degree_size": pending.span,
+                        "index": pending.index,
+                        "total": pending.total,
+                    },
+                )
+                tile.path.unlink(missing_ok=True)
+                continue
+
+            detections = analysis.get("detections", [])
+            record = AnalysisResult(
+                image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
+                prompt=analysis["prompt"],
+                caption=analysis["caption"],
+                unusual_summary=analysis["unusual_summary"],
+                detection_payload=serialize_detections(detections),
+                created_at=datetime.utcnow(),
+            )
+            session.add(record)
+            session.commit()
+
+            processed_count += 1
+            image_relative = str(tile.path.relative_to(UPLOAD_DIR))
+            logger.info(
+                "%s: analysis complete (%d detections).",
+                pending.progress_label,
+                len(detections),
+            )
+            await enqueue(
+                "tile",
+                {
+                    "index": pending.index,
+                    "total": pending.total,
+                    "lat": tile.lat,
+                    "lon": tile.lon,
+                    "caption": analysis["caption"],
+                    "unusual_summary": analysis["unusual_summary"],
+                    "detections": detections,
+                    "image": f"/data/uploads/{image_relative}",
+                    "timestamp": record.created_at.isoformat(),
+                    "provider_label": pending.provider_label,
+                    "bounds": pending.bounds,
+                    "degree_size": pending.span,
+                    "low_detail": tile.low_detail,
+                    "detail_ratio": tile.detail_ratio,
+                },
+            )
+
+    async def analysis_worker() -> None:
+        batch: List[PendingAnalysis] = []
+        try:
+            while True:
+                try:
+                    item = await analysis_queue.get()
+                except asyncio.CancelledError:  # pragma: no cover - shutdown cleanup
+                    break
+                if item is None:
+                    break
+                batch.append(item)
+                if len(batch) >= AREA_SCAN_ANALYSIS_BATCH_SIZE:
+                    try:
+                        await process_analysis_batch(batch)
+                    except Exception as exc:  # pragma: no cover - defensive logging
+                        logger.exception("Batched analysis worker failed: %s", exc)
+                    finally:
+                        batch = []
+        finally:
+            if batch:
+                try:
+                    await process_analysis_batch(batch)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.exception("Batched analysis worker failed: %s", exc)
+
+    analysis_task = asyncio.create_task(analysis_worker())
+    analysis_finished = False
+
+    async def finalize_analysis() -> None:
+        nonlocal analysis_finished
+        if analysis_finished:
+            return
+        await analysis_queue.put(None)
+        await analysis_task
+        analysis_finished = True
 
     async def handle_failure(message: str) -> None:
         if message not in download_failures:
@@ -490,6 +644,7 @@ async def stream_scan_area(
         await enqueue("download-failed", {"message": message})
 
     async def producer() -> None:
+        nonlocal analysis_finished
         tiles: List[AreaTile] = []
         tile_failures: List[str] = []
         try:
@@ -527,6 +682,7 @@ async def stream_scan_area(
             for failure in tile_failures:
                 if failure not in download_failures:
                     download_failures.append(failure)
+            await finalize_analysis()
             download_failures_list = list(download_failures)
             if not tiles:
                 base_message = "No imagery tiles were downloaded for the requested area."
@@ -561,6 +717,7 @@ async def stream_scan_area(
                 )
                 await enqueue("complete", summary)
         finally:
+            await finalize_analysis()
             if not processed_count and area_dir.exists():
                 try:
                     next(area_dir.iterdir())
@@ -618,6 +775,7 @@ async def reclassify_tiles(
         results_batch: List[Dict[str, object]] = []
         errors_batch: List[Dict[str, object]] = []
         has_pending_records = False
+        pending_tiles: List[Tuple[ReclassifyTilePayload, Path, str]] = []
 
         def flush_batch(force: bool = False) -> bytes | None:
             nonlocal results_batch, errors_batch, has_pending_records, total_processed
@@ -638,6 +796,129 @@ async def reclassify_tiles(
             results_batch = []
             errors_batch = []
             return json.dumps(payload).encode("utf-8") + b"\n"
+
+        async def analyze_cached_images(
+            paths: Sequence[Path],
+        ) -> List[Tuple[Dict[str, object] | None, Exception | None]]:
+            if not paths:
+                return []
+
+            try:
+                batch_results = await _run_analysis_batch(analyzer, paths, prompt)
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning(
+                    "Batched reclassification failed for %d images: %s",
+                    len(paths),
+                    exc,
+                )
+                batch_results = None
+
+            if isinstance(batch_results, tuple):
+                batch_results = list(batch_results)
+
+            analyses: List[Tuple[Dict[str, object] | None, Exception | None]] = []
+
+            if isinstance(batch_results, list) and len(batch_results) == len(paths):
+                for path, analysis in zip(paths, batch_results):
+                    if isinstance(analysis, dict):
+                        analyses.append((analysis, None))
+                        continue
+                    try:
+                        fallback_analysis = await _run_analysis(analyzer, path, prompt)
+                    except Exception as exc:  # pragma: no cover - analyzer failure
+                        analyses.append((None, exc))
+                    else:
+                        analyses.append((fallback_analysis, None))
+            else:
+                if batch_results is not None:
+                    logger.warning(
+                        "Batched reclassification returned %s results for %s images; evaluating individually.",
+                        len(batch_results),
+                        len(paths),
+                    )
+                for path in paths:
+                    try:
+                        analysis = await _run_analysis(analyzer, path, prompt)
+                    except Exception as exc:  # pragma: no cover - analyzer failure
+                        analyses.append((None, exc))
+                    else:
+                        analyses.append((analysis, None))
+
+            return analyses
+
+        async def process_pending(force: bool = False) -> List[bytes]:
+            nonlocal pending_tiles, has_pending_records, total_processed, total_errors
+            chunks: List[bytes] = []
+            if not pending_tiles:
+                return chunks
+            if not force and len(pending_tiles) < AREA_SCAN_ANALYSIS_BATCH_SIZE:
+                return chunks
+
+            batch_entries = pending_tiles
+            pending_tiles = []
+            paths = [path for _, path, _ in batch_entries]
+            analyses = await analyze_cached_images(paths)
+
+            for (tile_payload, image_path, relative_path), (analysis, error) in zip(
+                batch_entries, analyses
+            ):
+                if error is not None or not isinstance(analysis, dict):
+                    logger.error(
+                        "Reclassification failed for cached tile %s: %s",
+                        image_path,
+                        error,
+                        exc_info=error,
+                    )
+                    errors_batch.append(
+                        {
+                            "image": tile_payload.image,
+                            "message": "Analysis failed for cached tile.",
+                        }
+                    )
+                    total_errors += 1
+                    chunk = flush_batch()
+                    if chunk:
+                        chunks.append(chunk)
+                    continue
+
+                created_at = datetime.utcnow()
+                record = AnalysisResult(
+                    image_filename=relative_path,
+                    prompt=analysis["prompt"],
+                    caption=analysis["caption"],
+                    unusual_summary=analysis["unusual_summary"],
+                    detection_payload=serialize_detections(analysis["detections"]),
+                    created_at=created_at,
+                )
+                session.add(record)
+                has_pending_records = True
+
+                results_batch.append(
+                    {
+                        "image": f"/data/uploads/{relative_path}",
+                        "caption": analysis["caption"],
+                        "unusual_summary": analysis["unusual_summary"],
+                        "detections": analysis["detections"],
+                        "timestamp": created_at.isoformat(),
+                        "lat": tile_payload.lat,
+                        "lon": tile_payload.lon,
+                        "bounds": tile_payload.bounds,
+                        "degree_size": tile_payload.degree_size,
+                        "provider_label": tile_payload.provider_label,
+                    }
+                )
+                total_processed += 1
+
+                chunk = flush_batch()
+                if chunk:
+                    chunks.append(chunk)
+
+            if force:
+                chunk = flush_batch(force=True)
+                if chunk:
+                    chunks.append(chunk)
+
+            return chunks
 
         if not request.tiles:
             final_payload = {
@@ -675,53 +956,12 @@ async def reclassify_tiles(
                     yield chunk
                 continue
 
-            try:
-                analysis = await _run_analysis(analyzer, image_path, prompt)
-            except Exception as exc:  # pragma: no cover - model failure
-                logger.exception("Reclassification failed for cached tile %s: %s", image_path, exc)
-                errors_batch.append(
-                    {
-                        "image": tile.image,
-                        "message": "Analysis failed for cached tile.",
-                    }
-                )
-                total_errors += 1
-                chunk = flush_batch()
-                if chunk:
-                    yield chunk
-                continue
-
-            created_at = datetime.utcnow()
-            record = AnalysisResult(
-                image_filename=relative_path,
-                prompt=analysis["prompt"],
-                caption=analysis["caption"],
-                unusual_summary=analysis["unusual_summary"],
-                detection_payload=serialize_detections(analysis["detections"]),
-                created_at=created_at,
-            )
-            session.add(record)
-            has_pending_records = True
-
-            results_batch.append(
-                {
-                    "image": f"/data/uploads/{relative_path}",
-                    "caption": analysis["caption"],
-                    "unusual_summary": analysis["unusual_summary"],
-                    "detections": analysis["detections"],
-                    "timestamp": created_at.isoformat(),
-                    "lat": tile.lat,
-                    "lon": tile.lon,
-                    "bounds": tile.bounds,
-                    "degree_size": tile.degree_size,
-                    "provider_label": tile.provider_label,
-                }
-            )
-            total_processed += 1
-
-            chunk = flush_batch()
-            if chunk:
+            pending_tiles.append((tile, image_path, relative_path))
+            for chunk in await process_pending():
                 yield chunk
+
+        for chunk in await process_pending(force=True):
+            yield chunk
 
         chunk = flush_batch(force=True)
         if chunk:
