@@ -372,17 +372,55 @@ async def stream_scan_area(
         if controller.cancelled:
             raise ImageryCancellationError("Scan cancelled")
 
+        raw_index = getattr(tile, "sequence_index", None)
+        raw_total = getattr(tile, "total_tiles", None)
+        index = raw_index if isinstance(raw_index, int) and raw_index > 0 else processed_count + 1
+        total_tiles_hint = raw_total if isinstance(raw_total, int) and raw_total > 0 else None
+        progress_label = f"Tile {index}"
+        if total_tiles_hint:
+            progress_label += f"/{total_tiles_hint}"
+
+        bounds, span = _tile_bounds_payload(tile, tile_size)
+        provider_for_message = tile.provider_label or provider_label or tile.provider
+
+        status_message = (
+            f"{progress_label}: analyzing imagery at lat {tile.lat:.4f}, lon {tile.lon:.4f}."
+        )
+        logger.info(
+            "%s: analyzing imagery at lat %.4f, lon %.4f (%s).",
+            progress_label,
+            tile.lat,
+            tile.lon,
+            provider_for_message,
+        )
+        await enqueue(
+            "status",
+            {
+                "message": status_message,
+                "index": index,
+                "total": total_tiles_hint,
+                "lat": tile.lat,
+                "lon": tile.lon,
+                "bounds": bounds,
+                "degree_size": span,
+                "provider_label": provider_for_message,
+            },
+        )
+
         try:
             analysis = analyzer.analyze(tile.path, prompt)
         except Exception as exc:  # pragma: no cover - model failure
             logger.exception(
-                "Analyzer failed for tile at lat %s lon %s: %s", tile.lat, tile.lon, exc
+                "Analyzer failed for %s at lat %s lon %s: %s",
+                progress_label,
+                tile.lat,
+                tile.lon,
+                exc,
             )
             failure_message = (
-                f"Analysis failed for tile at {tile.lat:.4f}, {tile.lon:.4f}"
+                f"Analysis failed for {progress_label} at {tile.lat:.4f}, {tile.lon:.4f}"
             )
             analysis_failures.append(failure_message)
-            bounds, span = _tile_bounds_payload(tile, tile_size)
             await enqueue(
                 "analysis-failed",
                 {
@@ -391,17 +429,20 @@ async def stream_scan_area(
                     "lon": tile.lon,
                     "bounds": bounds,
                     "degree_size": span,
+                    "index": index,
+                    "total": total_tiles_hint,
                 },
             )
             tile.path.unlink(missing_ok=True)
             return
 
+        detections = analysis.get("detections", [])
         record = AnalysisResult(
             image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
             prompt=analysis["prompt"],
             caption=analysis["caption"],
             unusual_summary=analysis["unusual_summary"],
-            detection_payload=serialize_detections(analysis["detections"]),
+            detection_payload=serialize_detections(detections),
             created_at=datetime.utcnow(),
         )
         session.add(record)
@@ -409,19 +450,24 @@ async def stream_scan_area(
 
         processed_count += 1
         image_relative = str(tile.path.relative_to(UPLOAD_DIR))
-        bounds, span = _tile_bounds_payload(tile, tile_size)
+        logger.info(
+            "%s: analysis complete (%d detections).",
+            progress_label,
+            len(detections),
+        )
         await enqueue(
             "tile",
             {
-                "index": processed_count,
+                "index": index,
+                "total": total_tiles_hint,
                 "lat": tile.lat,
                 "lon": tile.lon,
                 "caption": analysis["caption"],
                 "unusual_summary": analysis["unusual_summary"],
-                "detections": analysis["detections"],
+                "detections": detections,
                 "image": f"/data/uploads/{image_relative}",
                 "timestamp": record.created_at.isoformat(),
-                "provider_label": provider_label,
+                "provider_label": provider_for_message,
                 "bounds": bounds,
                 "degree_size": span,
                 "low_detail": tile.low_detail,
