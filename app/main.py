@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import AsyncIterator, Dict, List
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -178,6 +179,14 @@ async def _unregister_scan(scan_id: str) -> None:
         _active_scans.pop(scan_id, None)
 
 
+async def _run_analysis(
+    analyzer, image_path: Path, prompt: str
+) -> Dict[str, object]:
+    """Execute the heavy model pipeline without blocking the event loop."""
+
+    return await run_in_threadpool(analyzer.analyze, image_path, prompt)
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
@@ -197,7 +206,7 @@ async def analyze(
 ):
     analyzer = get_analyzer()
     saved_path = await _save_upload(image)
-    analysis = analyzer.analyze(saved_path, prompt)
+    analysis = await _run_analysis(analyzer, saved_path, prompt)
 
     record = AnalysisResult(
         image_filename=saved_path.name,
@@ -285,7 +294,7 @@ async def scan_area(
 
     for tile in tiles:
         try:
-            analysis = analyzer.analyze(tile.path, prompt)
+            analysis = await _run_analysis(analyzer, tile.path, prompt)
         except Exception as exc:  # pragma: no cover - model failure
             logger.exception(
                 "Analyzer failed for tile at lat %s lon %s: %s", tile.lat, tile.lon, exc
@@ -408,7 +417,7 @@ async def stream_scan_area(
         )
 
         try:
-            analysis = analyzer.analyze(tile.path, prompt)
+            analysis = await _run_analysis(analyzer, tile.path, prompt)
         except Exception as exc:  # pragma: no cover - model failure
             logger.exception(
                 "Analyzer failed for %s at lat %s lon %s: %s",
@@ -667,7 +676,7 @@ async def reclassify_tiles(
                 continue
 
             try:
-                analysis = analyzer.analyze(image_path, prompt)
+                analysis = await _run_analysis(analyzer, image_path, prompt)
             except Exception as exc:  # pragma: no cover - model failure
                 logger.exception("Reclassification failed for cached tile %s: %s", image_path, exc)
                 errors_batch.append(
