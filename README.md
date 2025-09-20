@@ -1,4 +1,7 @@
 # Satellite Infrastructure Scanner
+<img width="1368" height="761" alt="sat1" src="https://github.com/user-attachments/assets/4dbd59bd-c5e8-418b-8ed0-a7604d208001" />
+<img width="1368" height="761" alt="sat2" src="https://github.com/user-attachments/assets/892ace8e-0c9a-4868-b610-2274f536fa7d" />
+
 
 This project provides a FastAPI web application that analyzes satellite imagery with
 state-of-the-art vision-language models. Users can upload satellite scenes, request a
