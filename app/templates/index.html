@@ -316,6 +316,7 @@
         let eventSource = null;
         let activeScanId = null;
         let tileCounter = 0;
+        let scanFootprintsLayer = null;
 
         function getBoundsFromInputs() {
           if (!window.L || typeof window.L.latLngBounds !== "function") {
@@ -364,6 +365,7 @@
           if (gallerySection) {
             gallerySection.classList.remove("visible");
           }
+          clearScanFootprints();
         }
 
         function appendEvent(message, type = "info") {
@@ -417,6 +419,61 @@
           if (gallerySection) {
             gallerySection.classList.add("visible");
           }
+        }
+
+        function clearScanFootprints() {
+          if (scanFootprintsLayer) {
+            scanFootprintsLayer.clearLayers();
+          }
+        }
+
+        function highlightTileOnMap(tile, status = "success") {
+          if (!scanFootprintsLayer || !tile || !tile.bounds) {
+            return;
+          }
+
+          const { bounds } = tile;
+          const south = Number.parseFloat(bounds.south);
+          const west = Number.parseFloat(bounds.west);
+          const north = Number.parseFloat(bounds.north);
+          const east = Number.parseFloat(bounds.east);
+          if ([south, west, north, east].some((value) => Number.isNaN(value))) {
+            return;
+          }
+
+          const styles = {
+            success: {
+              color: "#38bdf8",
+              weight: 1,
+              fillOpacity: 0.1,
+              dashArray: "4 4",
+              interactive: false,
+            },
+            warning: {
+              color: "#facc15",
+              weight: 1,
+              fillOpacity: 0.12,
+              dashArray: "4 6",
+              interactive: false,
+            },
+            error: {
+              color: "#f97316",
+              weight: 1.2,
+              fillOpacity: 0.18,
+              dashArray: "2 6",
+              interactive: false,
+            },
+          };
+
+          const style = styles[status] || styles.success;
+
+          L.rectangle(
+            [
+              [south, west],
+              [north, east],
+            ],
+            style
+          ).addTo(scanFootprintsLayer);
         }
 
         function setRunning(running) {
@@ -565,6 +622,8 @@
               appendEvent(`Tile #${index}: ${caption}`, "success");
               updateHistoryTable(payload);
               addThumbnail(payload);
+              const tileStatus = payload.low_detail ? "warning" : "success";
+              highlightTileOnMap(payload, tileStatus);
             });
 
             eventSource.addEventListener("download-failed", (evt) => {
@@ -579,6 +638,7 @@
               if (payload && payload.message) {
                 appendEvent(payload.message, "warning");
               }
+              highlightTileOnMap(payload, "error");
             });
 
             eventSource.addEventListener("complete", (evt) => {
@@ -638,7 +698,6 @@
             zoomControl: true,
             attributionControl: true,
           });
-
           L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
             attribution: "© OpenStreetMap contributors",
             maxZoom: 19,
@@ -649,6 +708,8 @@
             weight: 1.5,
             fillOpacity: 0.08,
           };
+
+          scanFootprintsLayer = L.layerGroup().addTo(map);
 
           function boundsToObject(bounds) {
             return {
