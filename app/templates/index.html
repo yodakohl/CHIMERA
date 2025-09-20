@@ -794,6 +794,167 @@
           });
         }
 
+        function handleReclassifyResult(result, state) {
+          if (!result) return;
+          cacheTile(result);
+          updateHistoryTable(result);
+          const message = result.caption
+            ? `Reclassified tile: ${result.caption}`
+            : "Reclassified cached tile.";
+          appendEvent(message, "success");
+          if (state) {
+            const currentResults = typeof state.results === "number" && !Number.isNaN(state.results)
+              ? state.results
+              : 0;
+            state.results = currentResults + 1;
+            const currentProcessed =
+              typeof state.processed === "number" && !Number.isNaN(state.processed)
+                ? state.processed
+                : 0;
+            state.processed = Math.max(currentProcessed, state.results);
+          }
+        }
+
+        function handleReclassifyError(error, state) {
+          const message = error && error.message
+            ? error.message
+            : "Failed to reclassify a cached tile.";
+          appendEvent(message, "warning");
+          if (state) {
+            const currentErrors =
+              typeof state.errors === "number" && !Number.isNaN(state.errors) ? state.errors : 0;
+            state.errors = currentErrors + 1;
+          }
+        }
+
+        function applyReclassifyPayload(payload, state) {
+          if (!payload || typeof payload !== "object") {
+            return state;
+          }
+          const results = Array.isArray(payload.results) ? payload.results : [];
+          results.forEach((result) => handleReclassifyResult(result, state));
+          const errors = Array.isArray(payload.errors) ? payload.errors : [];
+          errors.forEach((error) => handleReclassifyError(error, state));
+
+          if (state) {
+            if (typeof payload.processed === "number" && !Number.isNaN(payload.processed)) {
+              const currentProcessed =
+                typeof state.processed === "number" && !Number.isNaN(state.processed)
+                  ? state.processed
+                  : 0;
+              state.processed = Math.max(currentProcessed, payload.processed);
+            } else if (results.length) {
+              const currentProcessed =
+                typeof state.processed === "number" && !Number.isNaN(state.processed)
+                  ? state.processed
+                  : 0;
+              const currentResults =
+                typeof state.results === "number" && !Number.isNaN(state.results)
+                  ? state.results
+                  : 0;
+              state.processed = Math.max(currentProcessed, currentResults);
+            }
+
+            if (typeof payload.error_count === "number" && !Number.isNaN(payload.error_count)) {
+              const currentErrors =
+                typeof state.errors === "number" && !Number.isNaN(state.errors) ? state.errors : 0;
+              state.errors = Math.max(currentErrors, payload.error_count);
+            } else if (
+              !Array.isArray(payload.errors) &&
+              typeof payload.errors === "number" &&
+              !Number.isNaN(payload.errors)
+            ) {
+              const currentErrors =
+                typeof state.errors === "number" && !Number.isNaN(state.errors) ? state.errors : 0;
+              state.errors = Math.max(currentErrors, payload.errors);
+            }
+          }
+
+          return state;
+        }
+
+        function finalizeReclassifySummary(state) {
+          const processedValue =
+            state && typeof state.processed === "number" && !Number.isNaN(state.processed)
+              ? state.processed
+              : 0;
+          const resultsValue =
+            state && typeof state.results === "number" && !Number.isNaN(state.results)
+              ? state.results
+              : 0;
+          const errorsValue =
+            state && typeof state.errors === "number" && !Number.isNaN(state.errors)
+              ? state.errors
+              : 0;
+          const processed = processedValue || resultsValue;
+
+          if (processed && resultsValue === 0 && errorsValue === 0) {
+            appendEvent(
+              `Reclassified ${processed} cached tile${processed === 1 ? "" : "s"}.`,
+              "success"
+            );
+          } else if (processed) {
+            appendEvent(
+              `Reclassification completed for ${processed} cached tile${processed === 1 ? "" : "s"}.`,
+              "info"
+            );
+          } else if (!errorsValue) {
+            appendEvent("No cached tiles were reclassified.", "warning");
+          }
+        }
+
+        function handleReclassifyStreamResponse(response, state) {
+          if (!response || !response.body || typeof response.body.getReader !== "function") {
+            return Promise.reject(new Error("Streaming not supported"));
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          function processLine(line) {
+            if (!line) return;
+            const trimmed = line.trim();
+            if (!trimmed) return;
+            const event = safeParse(trimmed);
+            if (!event || typeof event !== "object") return;
+            applyReclassifyPayload(event, state);
+          }
+
+          return new Promise((resolve, reject) => {
+            function readNext() {
+              reader
+                .read()
+                .then(({ done, value }) => {
+                  if (done) {
+                    buffer += decoder.decode();
+                    const finalText = buffer.trim();
+                    if (finalText) {
+                      finalText.split(/\n+/).forEach(processLine);
+                    }
+                    resolve(state);
+                    return;
+                  }
+
+                  buffer += decoder.decode(value, { stream: true });
+                  const parts = buffer.split("\n");
+                  buffer = parts.pop() || "";
+                  parts.forEach(processLine);
+                  readNext();
+                })
+                .catch(reject);
+            }
+
+            readNext();
+          });
+        }
+
+        function handleReclassifyJsonResponse(response, state) {
+          return response
+            .json()
+            .then((data) => applyReclassifyPayload(data, state));
+        }
+
         if (reclassifyButton) {
           reclassifyButton.addEventListener("click", function () {
             if (reclassifyButton.disabled || tileCache.size === 0 || reclassifying) {
@@ -824,6 +985,8 @@
               "info"
             );
 
+            const reclassifyState = { processed: 0, results: 0, errors: 0 };
+
             fetch("/scan-area/reclassify", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -833,43 +996,13 @@
                 if (!response.ok) {
                   throw new Error("Request failed");
                 }
-                return response.json();
-              })
-              .then((data) => {
-                const results = Array.isArray(data.results) ? data.results : [];
-                const errors = Array.isArray(data.errors) ? data.errors : [];
-                let processed = typeof data.processed === "number" ? data.processed : results.length;
-
-                results.forEach((result) => {
-                  cacheTile(result);
-                  updateHistoryTable(result);
-                  const message = result.caption
-                    ? `Reclassified tile: ${result.caption}`
-                    : "Reclassified cached tile.";
-                  appendEvent(message, "success");
-                });
-
-                errors.forEach((error) => {
-                  const message =
-                    error && error.message
-                      ? error.message
-                      : "Failed to reclassify a cached tile.";
-                  appendEvent(message, "warning");
-                });
-
-                if (processed && results.length === 0 && errors.length === 0) {
-                  appendEvent(
-                    `Reclassified ${processed} cached tile${processed === 1 ? "" : "s"}.`,
-                    "success"
-                  );
-                } else if (processed) {
-                  appendEvent(
-                    `Reclassification completed for ${processed} cached tile${processed === 1 ? "" : "s"}.`,
-                    "info"
-                  );
-                } else if (!errors.length) {
-                  appendEvent("No cached tiles were reclassified.", "warning");
+                if (response.body && typeof response.body.getReader === "function") {
+                  return handleReclassifyStreamResponse(response, reclassifyState);
                 }
+                return handleReclassifyJsonResponse(response, reclassifyState);
+              })
+              .then((summaryState) => {
+                finalizeReclassifySummary(summaryState || reclassifyState);
               })
               .catch(() => {
                 appendEvent("Reclassifying cached tiles failed.", "error");
