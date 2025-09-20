@@ -40,7 +40,7 @@
         MapTiler's global satellite basemap is the default for crisp worldwide coverage, with NASA's
         GIBS mosaics and the USGS NAIP aerial program available as alternatives when desired.
       </p>
-      <form class="form-card" action="/scan-area" method="post">
+      <form class="form-card" id="area-scan-form" action="/scan-area" method="post">
         <div class="form-grid">
           <div class="field">
             <label for="north">North latitude</label>
@@ -148,8 +148,18 @@
         <label for="area-prompt">Analysis prompt</label>
         <textarea id="area-prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
 
-        <button type="submit">Scan area</button>
+        <div class="form-actions">
+          <button type="submit" id="start-scan">Scan area</button>
+          <button type="button" id="stop-scan" class="danger-button" disabled>
+            Stop scan
+          </button>
+        </div>
       </form>
+      <div class="scan-progress" id="scan-progress">
+        <h3>Live scan progress</h3>
+        <p class="hint">Updates appear as each tile is downloaded and analyzed.</p>
+        <ul id="scan-events" class="scan-events"></ul>
+      </div>
     </section>
 
     <section class="usage results">
@@ -243,20 +253,247 @@
     </section>
     <script>
       (function () {
-        const button = document.getElementById("global-scan");
-        if (!button) return;
-        button.addEventListener("click", function () {
-          const north = document.getElementById("north");
-          const south = document.getElementById("south");
-          const east = document.getElementById("east");
-          const west = document.getElementById("west");
-          const tile = document.getElementById("tile-size");
-          if (north) north.value = "90";
-          if (south) south.value = "-90";
-          if (east) east.value = "180";
-          if (west) west.value = "-180";
-          if (tile) tile.value = "{{ '%.2f'|format(max_tile_size) }}";
-        });
+        const form = document.getElementById("area-scan-form");
+        const startButton = document.getElementById("start-scan");
+        const stopButton = document.getElementById("stop-scan");
+        const globalButton = document.getElementById("global-scan");
+        const eventsList = document.getElementById("scan-events");
+        const progressSection = document.getElementById("scan-progress");
+        const historyTable = document.querySelector(".results table tbody");
+        let eventSource = null;
+        let activeScanId = null;
+        let tileCounter = 0;
+
+        function safeParse(data) {
+          try {
+            return JSON.parse(data);
+          } catch (error) {
+            return null;
+          }
+        }
+
+        function resetEvents() {
+          tileCounter = 0;
+          if (eventsList) {
+            eventsList.innerHTML = "";
+          }
+          if (progressSection) {
+            progressSection.classList.remove("visible");
+          }
+        }
+
+        function appendEvent(message, type = "info") {
+          if (!eventsList) return;
+          const item = document.createElement("li");
+          item.className = `event-${type}`;
+
+          const time = document.createElement("span");
+          time.className = "event-time";
+          time.textContent = new Date().toLocaleTimeString();
+
+          const text = document.createElement("span");
+          text.className = "event-message";
+          text.textContent = message;
+
+          item.appendChild(time);
+          item.appendChild(text);
+          eventsList.prepend(item);
+          if (progressSection) {
+            progressSection.classList.add("visible");
+          }
+        }
+
+        function setRunning(running) {
+          if (startButton) startButton.disabled = running;
+          if (stopButton) stopButton.disabled = !running;
+          if (!running) {
+            activeScanId = null;
+          }
+        }
+
+        function closeSource() {
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+        }
+
+        function updateHistoryTable(tile) {
+          if (!historyTable || !tile) return;
+          const row = document.createElement("tr");
+
+          const timestampCell = document.createElement("td");
+          const timestamp = tile.timestamp ? new Date(tile.timestamp) : new Date();
+          timestampCell.textContent = timestamp.toLocaleString();
+          row.appendChild(timestampCell);
+
+          const imageCell = document.createElement("td");
+          if (tile.image) {
+            const link = document.createElement("a");
+            link.href = tile.image;
+            link.target = "_blank";
+            link.textContent = tile.image.split("/").pop() || "Tile";
+            imageCell.appendChild(link);
+          } else {
+            imageCell.textContent = "Tile";
+          }
+          row.appendChild(imageCell);
+
+          const captionCell = document.createElement("td");
+          captionCell.textContent = tile.caption || "";
+          row.appendChild(captionCell);
+
+          const unusualCell = document.createElement("td");
+          unusualCell.textContent = tile.unusual_summary || "";
+          row.appendChild(unusualCell);
+
+          const detectionsCell = document.createElement("td");
+          if (Array.isArray(tile.detections) && tile.detections.length) {
+            const list = document.createElement("ul");
+            tile.detections.forEach((item) => {
+              if (!item) return;
+              const entry = document.createElement("li");
+              const strong = document.createElement("strong");
+              strong.textContent = item.object || "Object";
+              entry.appendChild(strong);
+              if (typeof item.confidence === "number") {
+                const confidenceText = document.createTextNode(
+                  ` (confidence ${item.confidence.toFixed(2)})`
+                );
+                entry.appendChild(confidenceText);
+              }
+              list.appendChild(entry);
+            });
+            detectionsCell.appendChild(list);
+          } else {
+            const empty = document.createElement("em");
+            empty.textContent = "No objects detected above the confidence threshold";
+            detectionsCell.appendChild(empty);
+          }
+          row.appendChild(detectionsCell);
+
+          historyTable.prepend(row);
+        }
+
+        if (globalButton) {
+          globalButton.addEventListener("click", function () {
+            const north = document.getElementById("north");
+            const south = document.getElementById("south");
+            const east = document.getElementById("east");
+            const west = document.getElementById("west");
+            const tile = document.getElementById("tile-size");
+            if (north) north.value = "90";
+            if (south) south.value = "-90";
+            if (east) east.value = "180";
+            if (west) west.value = "-180";
+            if (tile) tile.value = "{{ '%.2f'|format(max_tile_size) }}";
+          });
+        }
+
+        if (form) {
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            if (eventSource) return;
+
+            const formData = new FormData(form);
+            const params = new URLSearchParams();
+            formData.forEach((value, key) => {
+              if (typeof value === "string") {
+                params.append(key, value);
+              }
+            });
+
+            activeScanId =
+              (window.crypto && typeof window.crypto.randomUUID === "function"
+                ? window.crypto.randomUUID()
+                : `scan-${Date.now()}`);
+            params.append("scan_id", activeScanId);
+
+            const url = `/scan-area/stream?${params.toString()}`;
+            resetEvents();
+            appendEvent("Starting scan...", "info");
+            setRunning(true);
+
+            eventSource = new EventSource(url);
+
+            eventSource.addEventListener("status", (evt) => {
+              const payload = safeParse(evt.data);
+              if (payload && payload.message) {
+                appendEvent(payload.message, "info");
+              }
+            });
+
+            eventSource.addEventListener("tile", (evt) => {
+              const payload = safeParse(evt.data);
+              if (!payload) return;
+              const index =
+                typeof payload.index === "number" ? payload.index : tileCounter + 1;
+              tileCounter = index;
+              const caption = payload.caption || "Tile analyzed.";
+              appendEvent(`Tile #${index}: ${caption}`, "success");
+              updateHistoryTable(payload);
+            });
+
+            eventSource.addEventListener("download-failed", (evt) => {
+              const payload = safeParse(evt.data);
+              if (payload && payload.message) {
+                appendEvent(payload.message, "warning");
+              }
+            });
+
+            eventSource.addEventListener("analysis-failed", (evt) => {
+              const payload = safeParse(evt.data);
+              if (payload && payload.message) {
+                appendEvent(payload.message, "warning");
+              }
+            });
+
+            eventSource.addEventListener("complete", (evt) => {
+              const payload = safeParse(evt.data);
+              if (payload && payload.message) {
+                appendEvent(payload.message, "success");
+              } else {
+                appendEvent("Area scan completed.", "success");
+              }
+              setRunning(false);
+              closeSource();
+            });
+
+            eventSource.addEventListener("cancelled", (evt) => {
+              const payload = safeParse(evt.data);
+              appendEvent((payload && payload.message) || "Scan cancelled.", "warning");
+              setRunning(false);
+              closeSource();
+            });
+
+            eventSource.addEventListener("error", (evt) => {
+              const payload = safeParse(evt.data);
+              appendEvent((payload && payload.message) || "Scan failed.", "error");
+              setRunning(false);
+              closeSource();
+            });
+
+            eventSource.onerror = function () {
+              appendEvent("Connection to the scanner was interrupted.", "error");
+              setRunning(false);
+              closeSource();
+            };
+          });
+        }
+
+        if (stopButton) {
+          stopButton.addEventListener("click", function () {
+            if (!activeScanId) return;
+            fetch("/scan-area/stop", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ scan_id: activeScanId }),
+            }).catch(() => {});
+            appendEvent("Stop requested.", "info");
+            setRunning(false);
+            closeSource();
+          });
+        }
       })();
     </script>
   </body>
