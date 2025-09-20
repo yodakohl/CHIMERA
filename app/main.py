@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -618,9 +619,61 @@ def _safe_filename(filename: str) -> str:
     return f"{safe_stem}_{timestamp}{suffix}"
 
 
+_NO_UNUSUAL_FINDINGS_MARKERS = {
+    "nothing unusual",
+    "no unusual",
+    "nothing out of the ordinary",
+    "nothing out of ordinary",
+    "no anomalies",
+    "no unusual objects",
+    "no unusual activity",
+    "nothing noteworthy",
+    "nothing of note",
+    "none",
+}
+_UNUSUAL_SEGMENT_PATTERN = re.compile(r"(?:,|;|\\.|\\band\\b)", flags=re.IGNORECASE)
+
+
+def _unusual_summary_score(summary: str | None) -> int:
+    if not summary:
+        return 0
+
+    normalized = summary.strip().lower()
+    if not normalized:
+        return 0
+
+    if any(marker in normalized for marker in _NO_UNUSUAL_FINDINGS_MARKERS):
+        return 0
+
+    segments = [
+        segment.strip()
+        for segment in _UNUSUAL_SEGMENT_PATTERN.split(summary)
+        if segment.strip()
+    ]
+    return len(segments) or 1
+
+
+def _analysis_sort_key(
+    result: AnalysisResult, detections: List[Dict[str, object]]
+) -> tuple[int, int, datetime]:
+    summary_score = _unusual_summary_score(result.unusual_summary)
+    detection_score = len(detections)
+    timestamp = result.created_at or datetime.min
+    return (summary_score, detection_score, timestamp)
+
+
 def _build_results(session: Session) -> List[Dict[str, object]]:
-    statement = select(AnalysisResult).order_by(AnalysisResult.created_at.desc())
+    statement = select(AnalysisResult)
     results: List[AnalysisResult] = session.exec(statement).all()
+
+    decorated: List[tuple[tuple[int, int, datetime], AnalysisResult, List[Dict[str, object]]]] = []
+    for result in results:
+        detections = result.detections()
+        sort_key = _analysis_sort_key(result, detections)
+        decorated.append((sort_key, result, detections))
+
+    decorated.sort(key=lambda item: item[0], reverse=True)
+
     return [
         {
             "id": result.id,
@@ -628,10 +681,10 @@ def _build_results(session: Session) -> List[Dict[str, object]]:
             "prompt": result.prompt,
             "caption": result.caption,
             "unusual_summary": result.unusual_summary,
-            "detections": result.detections(),
+            "detections": detections,
             "created_at": result.created_at,
         }
-        for result in results
+        for _, result, detections in decorated
     ]
 
 
