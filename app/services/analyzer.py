@@ -23,7 +23,7 @@ class SatelliteAnalyzer:
     def __init__(self) -> None:
         logger.info("Loading captioning and VQA pipelines for satellite analysis")
         self.captioning = pipeline(
-            "image-to-text", model="Salesforce/blip-image-captioning-base"
+            "image-to-text", model="Salesforce/blip2-flan-t5-xl"
         )
         self.vqa = pipeline(
             "visual-question-answering", model="dandelin/vilt-b32-finetuned-vqa"
