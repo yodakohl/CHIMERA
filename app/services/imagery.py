@@ -38,6 +38,11 @@ GIBS_MIN_TILE_PIXELS = 256
 GIBS_MAX_TILE_PIXELS = 4096
 GIBS_DEFAULT_TIME = "default"
 NEIGHBOR_IDENTICAL_THRESHOLD = 0.995
+# Limit the number of tiles inspected when checking for blurry imagery so large
+# scans surface their first analysis results faster.
+DETAIL_SAMPLE_TILE_LIMIT = 64
+# Sample at most a 128×128 grid of pixels when estimating neighbor similarity.
+NEIGHBOR_SAMPLE_TARGET_PIXELS = 128 * 128
 
 # High-resolution aerial imagery from the USGS National Agriculture Imagery Program
 # (NAIP). Coverage is limited to the continental United States but offers ~1 m per
@@ -707,10 +712,12 @@ async def download_gibs_area_tiles(
             )
             aggregated_failures.extend(retry_failures)
             if tiles:
-                _, detail_flags, detail_scores = _tiles_need_higher_resolution(tiles)
+                _, detail_flags, detail_scores = _tiles_need_higher_resolution(
+                    tiles, max_samples=DETAIL_SAMPLE_TILE_LIMIT
+                )
                 for tile, flag, score in zip(tiles, detail_flags, detail_scores):
                     tile.low_detail = flag
-                    tile.detail_ratio = score
+                    tile.detail_ratio = score if score is not None else None
 
     return tiles, aggregated_failures
 
@@ -1047,13 +1054,14 @@ async def _download_with_adaptive_dim(
         if not tiles:
             return tiles, failures, current_dim, False, avg_ratio
 
-        needs_more_detail, detail_flags, detail_scores = _tiles_need_higher_resolution(tiles)
-        avg_ratio = None
-        if detail_scores:
-            avg_ratio = sum(detail_scores) / len(detail_scores)
+        needs_more_detail, detail_flags, detail_scores = _tiles_need_higher_resolution(
+            tiles, max_samples=DETAIL_SAMPLE_TILE_LIMIT
+        )
+        valid_scores = [score for score in detail_scores if score is not None]
+        avg_ratio = sum(valid_scores) / len(valid_scores) if valid_scores else None
         for tile, flag, score in zip(tiles, detail_flags, detail_scores):
             tile.low_detail = flag
-            tile.detail_ratio = score
+            tile.detail_ratio = score if score is not None else None
 
         if not needs_more_detail:
             return tiles, failures, current_dim, False, avg_ratio
@@ -1487,24 +1495,57 @@ def _tile_bounds(lat: float, lon: float, dim: float) -> Tuple[float, float, floa
 
 def _tiles_need_higher_resolution(
     tiles: Sequence[AreaTile],
-) -> Tuple[bool, List[bool], List[float]]:
-    if not tiles:
+    *,
+    max_samples: int | None = None,
+) -> Tuple[bool, List[bool], List[float | None]]:
+    tile_count = len(tiles)
+    if tile_count == 0:
         return False, [], []
 
-    low_detail_flags: List[bool] = []
-    detail_scores: List[float] = []
+    if max_samples is None or max_samples >= tile_count:
+        sample_indices = list(range(tile_count))
+    elif max_samples <= 0:
+        sample_indices = [tile_count // 2]
+    else:
+        sample_indices = _sample_tile_indices(tile_count, max_samples)
+
+    low_detail_flags: List[bool] = [False] * tile_count
+    detail_scores: List[float | None] = [None] * tile_count
     low_detail_count = 0
-    for tile in tiles:
+
+    for index in sample_indices:
+        tile = tiles[index]
         ratio = _tile_neighbor_similarity_ratio(tile.path)
-        detail_scores.append(ratio)
+        detail_scores[index] = ratio
         is_low_detail = ratio >= NEIGHBOR_IDENTICAL_THRESHOLD
-        low_detail_flags.append(is_low_detail)
+        low_detail_flags[index] = is_low_detail
         if is_low_detail:
             low_detail_count += 1
 
-    threshold = max(1, len(tiles) // 2)
+    threshold = max(1, len(sample_indices) // 2)
     needs_more_detail = low_detail_count >= threshold
     return needs_more_detail, low_detail_flags, detail_scores
+
+
+def _sample_tile_indices(total: int, limit: int) -> List[int]:
+    if total <= 0 or limit <= 0:
+        return []
+    if limit >= total:
+        return list(range(total))
+    if limit == 1:
+        return [total // 2]
+
+    step = (total - 1) / (limit - 1)
+    indices: List[int] = []
+    for sample in range(limit):
+        candidate = int(round(sample * step))
+        if indices and candidate <= indices[-1]:
+            candidate = indices[-1] + 1
+        if candidate >= total:
+            candidate = total - 1
+        indices.append(candidate)
+
+    return indices
 
 
 def _tile_neighbor_similarity_ratio(tile_path: Path) -> float:
@@ -1515,19 +1556,35 @@ def _tile_neighbor_similarity_ratio(tile_path: Path) -> float:
             if width < 2 or height < 2:
                 return 1.0
 
+            total_pixels = width * height
+            target = max(1, NEIGHBOR_SAMPLE_TARGET_PIXELS)
+            stride = max(1, int(round(math.sqrt(total_pixels / target))))
+            stride = min(stride, width - 1 if width > 1 else 1, height - 1 if height > 1 else 1)
+            if stride <= 0:
+                stride = 1
+
+            x_positions = list(range(0, width, stride))
+            y_positions = list(range(0, height, stride))
+            if x_positions[-1] != width - 1:
+                x_positions.append(width - 1)
+            if y_positions[-1] != height - 1:
+                y_positions.append(height - 1)
+
             pixels = image.load()
             identical = 0
             comparisons = 0
 
-            for y in range(height):
-                for x in range(width):
-                    if x > 0:
+            for y in y_positions:
+                for x in x_positions:
+                    if x >= stride:
                         comparisons += 1
-                        if pixels[x, y] == pixels[x - 1, y]:
+                        left_x = x - stride
+                        if pixels[x, y] == pixels[left_x, y]:
                             identical += 1
-                    if y > 0:
+                    if y >= stride:
                         comparisons += 1
-                        if pixels[x, y] == pixels[x, y - 1]:
+                        up_y = y - stride
+                        if pixels[x, y] == pixels[x, up_y]:
                             identical += 1
 
             if comparisons == 0:
