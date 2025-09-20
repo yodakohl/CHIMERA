@@ -74,6 +74,15 @@ h1 {
   background-color: rgba(95, 137, 255, 0.12);
 }
 
+.form-card .danger-button {
+  background: linear-gradient(120deg, #ef4444, #f97316);
+}
+
+.form-card .danger-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(239, 68, 68, 0.2);
+}
+
 .form-actions {
   display: flex;
   align-items: center;
@@ -103,6 +112,72 @@ h1 {
 
 .area {
   margin-bottom: 2.5rem;
+}
+
+.scan-progress {
+  display: none;
+  margin-top: 1.5rem;
+  padding: 1.25rem 1.5rem;
+  background-color: rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
+}
+
+.scan-progress.visible {
+  display: block;
+}
+
+.scan-progress h3 {
+  margin-top: 0;
+  margin-bottom: 0.25rem;
+}
+
+.scan-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.scan-events li {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.75rem 1rem;
+  border-radius: 10px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border-left: 3px solid rgba(255, 255, 255, 0.1);
+}
+
+.scan-events .event-time {
+  font-size: 0.8rem;
+  opacity: 0.7;
+  min-width: 3.5rem;
+}
+
+.scan-events .event-message {
+  flex: 1;
+}
+
+.scan-events li.event-info {
+  background-color: rgba(59, 130, 246, 0.12);
+  border-left-color: rgba(59, 130, 246, 0.6);
+}
+
+.scan-events li.event-success {
+  background-color: rgba(34, 197, 94, 0.18);
+  border-left-color: rgba(34, 197, 94, 0.65);
+}
+
+.scan-events li.event-warning {
+  background-color: rgba(251, 191, 36, 0.18);
+  border-left-color: rgba(251, 191, 36, 0.65);
+}
+
+.scan-events li.event-error {
+  background-color: rgba(248, 113, 113, 0.2);
+  border-left-color: rgba(248, 113, 113, 0.7);
 }
 
 .flash {

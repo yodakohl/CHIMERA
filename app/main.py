@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import AsyncIterator, Dict, List
 
-from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, select
@@ -16,13 +18,16 @@ from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult, ApiUsageStat
 from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
 from .services.imagery import (
+    AreaTile,
     GIBS_DEFAULT_LAYER,
     MAX_DIM,
     MIN_DIM,
     ImageryProviderKey,
     PROVIDER_METADATA,
     download_area_tiles,
+    ImageryCancellationError,
 )
+from pydantic import BaseModel
 
 app = FastAPI(title="Satellite Infrastructure Scanner", version="0.1.0")
 
@@ -58,6 +63,45 @@ logger = logging.getLogger(__name__)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 app.mount("/data/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+
+class StopScanRequest(BaseModel):
+    scan_id: str
+
+
+class ScanController:
+    def __init__(self) -> None:
+        self.cancel_event = asyncio.Event()
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel_event.is_set()
+
+
+_active_scans: Dict[str, ScanController] = {}
+_scan_lock = asyncio.Lock()
+
+
+async def _register_scan(scan_id: str) -> ScanController:
+    async with _scan_lock:
+        if scan_id in _active_scans:
+            raise HTTPException(status_code=409, detail="Scan already in progress")
+        controller = ScanController()
+        _active_scans[scan_id] = controller
+        return controller
+
+
+async def _lookup_scan(scan_id: str) -> ScanController | None:
+    async with _scan_lock:
+        return _active_scans.get(scan_id)
+
+
+async def _unregister_scan(scan_id: str) -> None:
+    async with _scan_lock:
+        _active_scans.pop(scan_id, None)
 
 
 @app.on_event("startup")
@@ -197,6 +241,243 @@ async def scan_area(
         except StopIteration:
             area_dir.rmdir()
 
+    summary = _build_scan_summary_details(
+        tiles=tiles,
+        tile_size=tile_size,
+        provider=provider,
+        provider_label=provider_label,
+        download_failures=download_failures,
+        analysis_failures=analysis_failures,
+        processed_count=processed_count,
+    )
+    message = str(summary.get("message", "Area scan completed."))
+    return _render_home(
+        request,
+        session,
+        message=message,
+        selected_provider=provider.value,
+    )
+
+
+@app.get("/scan-area/stream")
+async def stream_scan_area(
+    request: Request,
+    scan_id: str = Query(..., description="Unique client-generated identifier for the scan"),
+    north: float = Query(DEFAULT_SCAN_BOUNDS["north"]),
+    south: float = Query(DEFAULT_SCAN_BOUNDS["south"]),
+    east: float = Query(DEFAULT_SCAN_BOUNDS["east"]),
+    west: float = Query(DEFAULT_SCAN_BOUNDS["west"]),
+    tile_size: float = Query(DEFAULT_SCAN_TILE_SIZE, alias="tile_size"),
+    provider: ImageryProviderKey = Query(DEFAULT_IMAGERY_PROVIDER),
+    prompt: str = Query(DEFAULT_PROMPT),
+    date: str | None = Query(DEFAULT_SCAN_DATE),
+    session: Session = Depends(get_session),
+):
+    scan_id = scan_id.strip()
+    if not scan_id:
+        raise HTTPException(status_code=400, detail="scan_id query parameter is required")
+
+    controller = await _register_scan(scan_id)
+    analyzer = get_analyzer()
+    area_dir = AREA_SCAN_DIR / datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+
+    requested_date = (date or "").strip() or None
+    provider_meta = PROVIDER_METADATA.get(provider, {})
+    provider_label = provider_meta.get("label", provider.value)
+
+    events: asyncio.Queue[tuple[str, Dict[str, object]]] = asyncio.Queue()
+    processed_count = 0
+    download_failures: List[str] = []
+    analysis_failures: List[str] = []
+
+    async def enqueue(event: str, data: Dict[str, object]) -> None:
+        await events.put((event, data))
+
+    async def handle_tile(tile: AreaTile) -> None:
+        nonlocal processed_count
+        if controller.cancelled:
+            raise ImageryCancellationError("Scan cancelled")
+
+        try:
+            analysis = analyzer.analyze(tile.path, prompt)
+        except Exception as exc:  # pragma: no cover - model failure
+            logger.exception(
+                "Analyzer failed for tile at lat %s lon %s: %s", tile.lat, tile.lon, exc
+            )
+            failure_message = (
+                f"Analysis failed for tile at {tile.lat:.4f}, {tile.lon:.4f}"
+            )
+            analysis_failures.append(failure_message)
+            await enqueue(
+                "analysis-failed",
+                {
+                    "message": failure_message,
+                    "lat": tile.lat,
+                    "lon": tile.lon,
+                },
+            )
+            tile.path.unlink(missing_ok=True)
+            return
+
+        record = AnalysisResult(
+            image_filename=str(tile.path.relative_to(UPLOAD_DIR)),
+            prompt=analysis["prompt"],
+            caption=analysis["caption"],
+            unusual_summary=analysis["unusual_summary"],
+            detection_payload=serialize_detections(analysis["detections"]),
+            created_at=datetime.utcnow(),
+        )
+        session.add(record)
+        session.commit()
+
+        processed_count += 1
+        image_relative = str(tile.path.relative_to(UPLOAD_DIR))
+        await enqueue(
+            "tile",
+            {
+                "index": processed_count,
+                "lat": tile.lat,
+                "lon": tile.lon,
+                "caption": analysis["caption"],
+                "unusual_summary": analysis["unusual_summary"],
+                "detections": analysis["detections"],
+                "image": f"/data/uploads/{image_relative}",
+                "timestamp": record.created_at.isoformat(),
+                "provider_label": provider_label,
+            },
+        )
+
+    async def handle_failure(message: str) -> None:
+        if message not in download_failures:
+            download_failures.append(message)
+        await enqueue("download-failed", {"message": message})
+
+    async def producer() -> None:
+        tiles: List[AreaTile] = []
+        tile_failures: List[str] = []
+        try:
+            await enqueue(
+                "status",
+                {
+                    "message": f"Starting scan using {provider_label} imagery.",
+                    "provider_label": provider_label,
+                },
+            )
+            tiles, tile_failures = await download_area_tiles(
+                provider=provider,
+                north=north,
+                south=south,
+                east=east,
+                west=west,
+                dim=tile_size,
+                output_dir=area_dir,
+                date=requested_date,
+                progress_callback=handle_tile,
+                failure_callback=handle_failure,
+                cancel_event=controller.cancel_event,
+            )
+        except ImageryCancellationError:
+            await enqueue("cancelled", {"message": "Scan cancelled."})
+        except ValueError as exc:
+            await enqueue("error", {"message": str(exc)})
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception("Area scan failed: %s", exc)
+            await enqueue(
+                "error",
+                {"message": "Unexpected error while scanning the requested area."},
+            )
+        else:
+            for failure in tile_failures:
+                if failure not in download_failures:
+                    download_failures.append(failure)
+            download_failures_list = list(download_failures)
+            if not tiles:
+                base_message = "No imagery tiles were downloaded for the requested area."
+                if download_failures_list:
+                    failures_count = len(download_failures_list)
+                    failure_plural = "s" if failures_count != 1 else ""
+                    base_message += (
+                        f" {failures_count} imagery request{failure_plural} failed."
+                    )
+                    base_message += f" First failure detail: {download_failures_list[0]}."
+                if provider_label:
+                    base_message += f" Provider: {provider_label}."
+                await enqueue(
+                    "complete",
+                    {
+                        "message": base_message,
+                        "provider_label": provider_label,
+                        "processed_tiles": processed_count,
+                        "download_failures": download_failures_list,
+                        "analysis_failures": analysis_failures,
+                    },
+                )
+            else:
+                summary = _build_scan_summary_details(
+                    tiles=tiles,
+                    tile_size=tile_size,
+                    provider=provider,
+                    provider_label=provider_label,
+                    download_failures=download_failures_list,
+                    analysis_failures=analysis_failures,
+                    processed_count=processed_count,
+                )
+                await enqueue("complete", summary)
+        finally:
+            if not processed_count and area_dir.exists():
+                try:
+                    next(area_dir.iterdir())
+                except StopIteration:
+                    area_dir.rmdir()
+            await enqueue("_end", {})
+
+    async def event_stream() -> AsyncIterator[bytes]:
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                if await request.is_disconnected():
+                    controller.cancel()
+                try:
+                    event_type, payload = await asyncio.wait_for(events.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if controller.cancelled and events.empty():
+                        break
+                    continue
+                if event_type == "_end":
+                    break
+                yield _sse_event(event_type, payload)
+        finally:
+            controller.cancel()
+            await producer_task
+            await _unregister_scan(scan_id)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/scan-area/stop")
+async def stop_scan(request: StopScanRequest) -> Dict[str, object]:
+    scan_id = request.scan_id.strip()
+    if not scan_id:
+        raise HTTPException(status_code=400, detail="scan_id is required")
+
+    controller = await _lookup_scan(scan_id)
+    if controller is None:
+        return {"status": "not_found"}
+
+    controller.cancel()
+    return {"status": "stopping"}
+
+
+def _build_scan_summary_details(
+    *,
+    tiles: List[AreaTile],
+    tile_size: float,
+    provider: ImageryProviderKey,
+    provider_label: str | None,
+    download_failures: List[str],
+    analysis_failures: List[str],
+    processed_count: int,
+) -> Dict[str, object]:
     summary_parts: List[str] = []
     if provider_label:
         summary_parts.append(f"Imagery provider: {provider_label}.")
@@ -211,16 +492,14 @@ async def scan_area(
     )
     layer_description = tiles[0].layer_description if tiles else None
     detail_ratios = [tile.detail_ratio for tile in tiles if tile.detail_ratio is not None]
+    avg_ratio = None
     if processed_count:
         processed_plural = "s" if processed_count != 1 else ""
         summary_parts.append(f"Analyzed {processed_count} imagery tile{processed_plural}.")
     if tile_layer:
         description = layer_description or tile_layer
         summary_parts.append(f"Imagery layer: {description}.")
-        if (
-            provider == ImageryProviderKey.NASA_GIBS
-            and tile_layer != GIBS_DEFAULT_LAYER
-        ):
+        if provider == ImageryProviderKey.NASA_GIBS and tile_layer != GIBS_DEFAULT_LAYER:
             summary_parts.append(
                 "Switched to a higher-resolution NASA mosaic after the default VIIRS imagery appeared too blocky."
             )
@@ -271,12 +550,25 @@ async def scan_area(
         )
 
     message = " ".join(summary_parts) or "Area scan completed."
-    return _render_home(
-        request,
-        session,
-        message=message,
-        selected_provider=provider.value,
-    )
+    return {
+        "message": message,
+        "provider_label": provider_label,
+        "processed_tiles": processed_count,
+        "tile_span": tile_span,
+        "tile_resolution": tile_resolution,
+        "approx_resolution_m": approx_resolution_m,
+        "tile_layer": tile_layer,
+        "layer_description": layer_description,
+        "download_failures": download_failures,
+        "analysis_failures": analysis_failures,
+        "low_detail_remaining": low_detail_remaining,
+        "average_detail_ratio": avg_ratio,
+    }
+
+
+def _sse_event(event: str, data: Dict[str, object]) -> bytes:
+    payload = json.dumps(data, default=str)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
 def _safe_filename(filename: str) -> str:
