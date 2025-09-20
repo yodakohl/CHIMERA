@@ -88,14 +88,77 @@ def _as_tensor(sample) -> torch.Tensor:
     return tensor.contiguous().float()
 
 
-def _batched(iterable: Sequence, batch_size: int) -> Iterable[Sequence]:
-    for start in range(0, len(iterable), batch_size):
-        yield iterable[start : start + batch_size]
+def _batched(
+    iterable: Sequence | torch.Tensor, batch_size: int
+) -> Iterable[Sequence | torch.Tensor]:
+    if isinstance(iterable, torch.Tensor):
+        length = iterable.shape[0]
+        for start in range(0, length, batch_size):
+            yield iterable[start : start + batch_size]
+    else:
+        for start in range(0, len(iterable), batch_size):
+            yield iterable[start : start + batch_size]
+
+
+def _as_batch_tensor(batch) -> torch.Tensor:
+    if isinstance(batch, torch.Tensor):
+        tensor = batch
+    else:
+        tensor = torch.as_tensor(batch)
+
+    if tensor.ndim == 2:
+        tensor = tensor.unsqueeze(0).unsqueeze(0)
+    elif tensor.ndim == 3:
+        if tensor.shape[0] in (1, 3):
+            tensor = tensor.unsqueeze(0)
+        elif tensor.shape[-1] in (1, 3):
+            tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        else:
+            tensor = tensor.unsqueeze(1)
+    elif tensor.ndim != 4:
+        raise ValueError("Batched inputs must have shape (batch, channels, height, width)")
+
+    if tensor.shape[1] not in (1, 3) and tensor.shape[-1] in (1, 3):
+        tensor = tensor.permute(0, 3, 1, 2)
+
+    return tensor.contiguous().float()
+
+
+def _prepare_batch(batch, transform: Callable | None) -> torch.Tensor:
+    if transform is None:
+        if isinstance(batch, torch.Tensor):
+            return _as_batch_tensor(batch)
+        tensors = [_as_tensor(sample) for sample in batch]
+        return torch.stack(tensors, dim=0)
+
+    if isinstance(batch, torch.Tensor):
+        try:
+            transformed = transform(batch)
+        except TypeError:
+            pass
+        else:
+            try:
+                return _as_batch_tensor(transformed)
+            except (TypeError, ValueError):
+                # Fall back to per-sample processing when the transform cannot
+                # handle batched input.  Errors from conversion are silenced so
+                # transforms that expect single images continue to work.
+                pass
+
+    tensors: List[torch.Tensor] = []
+    for sample in batch:
+        transformed = transform(sample)
+        tensors.append(_as_tensor(transformed))
+
+    if not tensors:
+        return torch.empty((0,), dtype=torch.float32)
+
+    return torch.stack(tensors, dim=0)
 
 
 def classify_images_gpu(
     model: torch.nn.Module | Callable[[torch.Tensor], torch.Tensor],
-    images: Sequence,
+    images: Sequence | torch.Tensor,
     *,
     batch_size: int = 32,
     device: str | torch.device | None = None,
@@ -110,7 +173,8 @@ def classify_images_gpu(
         ``(batch, channels, height, width)`` and return a tensor where the first dimension
         corresponds to the batch.
     images:
-        Sequence of images or tensors.  Items are converted into tensors automatically.
+        Sequence of images or a pre-batched ``torch.Tensor``.  Items are converted into
+        tensors automatically when needed.
     batch_size:
         Number of images to evaluate per forward pass.  Defaults to ``32``.
     device:
@@ -123,9 +187,20 @@ def classify_images_gpu(
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
 
-    items = list(images)
-    if not items:
-        return torch.empty((0,), dtype=torch.float32)
+    if isinstance(images, torch.Tensor):
+        if images.ndim < 3:
+            raise ValueError("Tensor inputs must have at least three dimensions")
+        if images.ndim == 3:
+            batches_source: Sequence | torch.Tensor = [images]
+        else:
+            if images.shape[0] == 0:
+                return torch.empty((0,), dtype=torch.float32)
+            batches_source = images
+    else:
+        items = list(images)
+        if not items:
+            return torch.empty((0,), dtype=torch.float32)
+        batches_source = items
 
     device_obj = _select_device(device)
     non_blocking = device_obj.type == "cuda"
@@ -136,20 +211,8 @@ def classify_images_gpu(
     outputs: List[torch.Tensor] = []
 
     with torch.no_grad():
-        for batch in _batched(items, batch_size):
-            tensors: List[torch.Tensor] = []
-            for sample in batch:
-                tensor = transform(sample) if transform else _as_tensor(sample)
-                if not isinstance(tensor, torch.Tensor):
-                    tensor = torch.as_tensor(tensor)
-                if tensor.ndim == 2:
-                    tensor = tensor.unsqueeze(0)
-                tensors.append(tensor.contiguous().to(dtype=torch.float32))
-
-            if not tensors:
-                continue
-
-            batch_tensor = torch.stack(tensors, dim=0).to(
+        for batch in _batched(batches_source, batch_size):
+            batch_tensor = _prepare_batch(batch, transform).to(
                 device=device_obj,
                 dtype=torch.float32,
                 non_blocking=non_blocking,
