@@ -144,14 +144,16 @@ def classify_images_gpu(
                     tensor = torch.as_tensor(tensor)
                 if tensor.ndim == 2:
                     tensor = tensor.unsqueeze(0)
-                tensors.append(
-                    tensor.to(device=device_obj, dtype=torch.float32, non_blocking=non_blocking)
-                )
+                tensors.append(tensor.contiguous().to(dtype=torch.float32))
 
             if not tensors:
                 continue
 
-            batch_tensor = torch.stack(tensors, dim=0)
+            batch_tensor = torch.stack(tensors, dim=0).to(
+                device=device_obj,
+                dtype=torch.float32,
+                non_blocking=non_blocking,
+            )
             result = prepared_model(batch_tensor)
             if not isinstance(result, torch.Tensor):
                 raise TypeError("Model must return a torch.Tensor for batched classification")
