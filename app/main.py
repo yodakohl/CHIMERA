@@ -33,15 +33,15 @@ AREA_SCAN_DIR = UPLOAD_DIR / "area_scans"
 AREA_SCAN_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_SCAN_BOUNDS = {
-    "north": 37.83,
-    "south": 37.73,
-    "west": -122.52,
-    "east": -122.47,
+    "north": 48.2238,
+    "south": 48.1938,
+    "west": 16.3588,
+    "east": 16.3888,
 }
-# A 0.05° tile size yields a compact 2x1 grid for the default bounding box.
-DEFAULT_SCAN_TILE_SIZE = 0.05
+# A 0.03° tile size provides a single high-resolution tile for the Vienna default area.
+DEFAULT_SCAN_TILE_SIZE = 0.03
 DEFAULT_SCAN_DATE: str | None = None
-DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.NASA_GIBS
+DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.MAPTILER_SATELLITE
 
 
 PROVIDER_OPTIONS = [

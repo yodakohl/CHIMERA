@@ -13,8 +13,9 @@ Key features:
 - **General object detection** powered by a DETR model capable of identifying a broad range of
   infrastructure and equipment beyond a fixed list of examples.
 - **Persistent storage** of every analysis run, including references to uploaded imagery.
-- **Automatic area scanning** by fetching imagery for a bounding box from NASA GIBS or, when higher
-  detail is required, USGS NAIP aerial photography, analyzing each tile without preparing archives.
+- **Automatic area scanning** by fetching imagery for a bounding box from MapTiler's global satellite
+  basemap (high-resolution by default) with optional NASA GIBS mosaics and USGS NAIP aerial
+  photography, analyzing each tile without preparing archives.
 
 ## Getting started
 
@@ -35,22 +36,30 @@ Key features:
    The first run will download the required Hugging Face models (BLIP for captioning and VILT for
    visual question answering). Expect this to take a few minutes.
 
-3. Launch the development server:
+3. Configure your MapTiler API key (required for the default imagery provider):
+
+   ```bash
+   export MAPTILER_API_KEY="your_maptiler_api_key"
+   ```
+
+   You can create and manage keys from your MapTiler Cloud account. The key is read from the
+   environment at runtime, so shell configuration such as `.env` files also works.
+
+4. Launch the development server:
 
    ```bash
    uvicorn app.main:app --reload
    ```
 
-4. Open <http://localhost:8000> in your browser. You can either upload a single satellite image or
-   use the automatic area scan form to request imagery for a latitude/longitude bounding box. The
-   app downloads tiles from your selected provider—NASA's Global Imagery Browse Services (GIBS) by
-   default, or USGS NAIP aerial mosaics when you need sub-meter detail—analyzes each tile, and
-   stores the results so you can revisit previous detections. Each scan is limited to 50 imagery
-   requests to prevent accidental overload of the services, and every tile is requested at a minimum
-   of 256×256 pixels so the vision models have enough detail to work with even for small bounding
-   boxes. When the default VIIRS true-color layer is too blocky for object recognition, the
-   downloader automatically retries with the higher resolution Landsat WELD mosaic to deliver
-   ~30 m/pixel imagery.
+5. Open <http://localhost:8000> in your browser. You can either upload a single satellite image or
+   use the automatic area scan form to request imagery for a latitude/longitude bounding box. By
+   default the app retrieves crisp MapTiler satellite imagery centered on Vienna, Austria, but you
+   can switch to NASA's Global Imagery Browse Services (GIBS) or the USGS NAIP aerial mosaics when
+   you need alternate coverage. Each scan is limited to 50 imagery requests to prevent accidental
+   overload of the services, and every tile is requested at a minimum of 256×256 pixels so the
+   vision models have enough detail to work with even for small bounding boxes. When the NASA GIBS
+   VIIRS true-color layer is too blocky for object recognition, the downloader automatically retries
+   with the higher resolution Landsat WELD mosaic to deliver ~30 m/pixel imagery.
 
 Uploaded imagery is stored under `data/uploads`, and analysis metadata is tracked in the
 `data/satellite_scans.db` SQLite database.
