@@ -52,6 +52,7 @@ def test_maptiler_trims_api_key_and_uses_referer(tmp_path, monkeypatch):
     monkeypatch.setenv("IMAGERY_REQUEST_DELAY", "0")
     monkeypatch.setenv("IMAGERY_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(imagery, "_tile_cache", None)
+    monkeypatch.setattr(imagery, "_last_remote_request_at", None)
     monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
 
     tiles, failures = asyncio.run(
@@ -121,6 +122,7 @@ def test_maptiler_reuses_cached_tiles(tmp_path, monkeypatch):
     monkeypatch.setenv("IMAGERY_REQUEST_DELAY", "0")
     monkeypatch.setenv("IMAGERY_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(imagery, "_tile_cache", None)
+    monkeypatch.setattr(imagery, "_last_remote_request_at", None)
     monkeypatch.setattr(httpx, "AsyncClient", MockAsyncClient)
 
     first_dir = tmp_path / "first"
