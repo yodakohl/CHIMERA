@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import logging.config
 import re
 import shutil
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,8 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, delete, select
+
+from pydantic import BaseModel
 
 from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult, ApiUsageStat
@@ -31,7 +35,32 @@ from .services.imagery import (
     download_area_tiles,
     ImageryCancellationError,
 )
-from pydantic import BaseModel
+
+try:
+    from uvicorn.config import LOGGING_CONFIG as UVICORN_LOGGING_CONFIG
+except ImportError:  # pragma: no cover - uvicorn not installed
+    UVICORN_LOGGING_CONFIG = None
+
+
+def _configure_logging() -> None:
+    """Align application loggers with the Uvicorn configuration."""
+
+    if UVICORN_LOGGING_CONFIG is not None:
+        config = deepcopy(UVICORN_LOGGING_CONFIG)
+        config.setdefault("loggers", {})
+        uvicorn_logger = config["loggers"].get("uvicorn", {})
+        handlers = uvicorn_logger.get("handlers", ["default"])
+        config["loggers"]["app"] = {
+            "handlers": handlers,
+            "level": "INFO",
+            "propagate": True,
+        }
+        logging.config.dictConfig(config)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+
+_configure_logging()
 
 app = FastAPI(title="Satellite Infrastructure Scanner", version="0.1.0")
 
