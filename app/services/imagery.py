@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
@@ -9,11 +10,15 @@ from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import httpx
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
+
+from ..database import DATA_DIR
+from .cache import TileCache
+from .usage import record_api_usage
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +80,15 @@ RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
 
 MIN_DIM = 0.01
-MAX_DIM = 0.5
+MAX_DIM = 360.0
 MAX_TILES_PER_RUN = 50
 REQUEST_TIMEOUT = httpx.Timeout(60.0)
+
+IMAGERY_REQUEST_DELAY_ENV = "IMAGERY_REQUEST_DELAY"
+DEFAULT_REQUEST_DELAY = 5.0
+IMAGERY_CACHE_DIR_ENV = "IMAGERY_CACHE_DIR"
+
+_tile_cache: TileCache | None = None
 
 
 class ImageryProviderKey(str, Enum):
@@ -143,6 +154,105 @@ HIGH_RES_LAYER = GibsLayerConfig(
 LAYER_SEQUENCE: Tuple[GibsLayerConfig, ...] = (DEFAULT_LAYER, HIGH_RES_LAYER)
 
 _layer_latest_date_cache: Dict[str, str] = {}
+
+
+def _determine_cache_dir() -> Path:
+    override = os.getenv(IMAGERY_CACHE_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return DATA_DIR / "tile_cache"
+
+
+def _get_tile_cache() -> TileCache:
+    global _tile_cache
+    cache_dir = _determine_cache_dir()
+    if _tile_cache is None or _tile_cache.root != cache_dir:
+        _tile_cache = TileCache(cache_dir)
+    return _tile_cache
+
+
+def _request_delay_seconds() -> float:
+    raw_value = os.getenv(IMAGERY_REQUEST_DELAY_ENV, "").strip()
+    if not raw_value:
+        return DEFAULT_REQUEST_DELAY
+    try:
+        delay = float(raw_value)
+    except ValueError:
+        return DEFAULT_REQUEST_DELAY
+    return max(0.0, delay)
+
+
+async def _respect_rate_limit() -> None:
+    delay = _request_delay_seconds()
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+
+def _cache_key(provider: str, *parts: object) -> str:
+    tokens: List[str] = [provider]
+    for part in parts:
+        if isinstance(part, float):
+            tokens.append(f"{part:.6f}")
+        elif part is None:
+            tokens.append("none")
+        else:
+            tokens.append(str(part))
+    return "|".join(tokens)
+
+
+def _area_tile_from_metadata(
+    *,
+    lat: float,
+    lon: float,
+    path: Path,
+    metadata: Dict[str, Any],
+    default_layer: str,
+    default_provider: ImageryProviderKey,
+    default_label: str | None,
+    default_degree_size: float,
+    fallback_pixels: int,
+    default_native_dim: float,
+    default_pixels_per_degree: float,
+) -> AreaTile:
+    provider = str(metadata.get("provider") or default_provider.value)
+    provider_label = metadata.get("provider_label") or default_label
+    layer = str(metadata.get("layer") or default_layer)
+    source_url = str(metadata.get("source_url") or "")
+
+    degree_size = float(metadata.get("degree_size") or 0.0)
+    if degree_size <= 0:
+        degree_size = default_degree_size
+
+    native_dim = float(metadata.get("native_dim") or 0.0)
+    if native_dim <= 0:
+        native_dim = default_native_dim
+
+    pixel_size = int(metadata.get("pixel_size") or 0)
+    if pixel_size <= 0:
+        pixel_size = _actual_tile_size(path, fallback_pixels)
+
+    pixels_per_degree = float(metadata.get("pixels_per_degree") or 0.0)
+    if pixels_per_degree <= 0 and degree_size > 0:
+        pixels_per_degree = pixel_size / degree_size
+    elif pixels_per_degree <= 0:
+        pixels_per_degree = default_pixels_per_degree
+
+    layer_description = metadata.get("layer_description")
+
+    return AreaTile(
+        lat=lat,
+        lon=lon,
+        path=path,
+        source_url=source_url,
+        pixel_size=pixel_size,
+        degree_size=degree_size,
+        layer=layer,
+        native_dim=native_dim,
+        pixels_per_degree=pixels_per_degree,
+        layer_description=layer_description,
+        provider=provider,
+        provider_label=provider_label,
+    )
 
 
 @dataclass
@@ -287,6 +397,8 @@ async def download_maptiler_area_tiles(
     failures: List[str] = []
     native_dim = _maptiler_native_dim()
 
+    cache = _get_tile_cache()
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for lat in lat_centers:
             for lon in lon_centers:
@@ -305,8 +417,51 @@ async def download_maptiler_area_tiles(
                     height=tile_pixels,
                 )
 
+                filename = _tile_filename(
+                    lat,
+                    lon,
+                    date,
+                    prefix="maptiler",
+                    extension=MAPTILER_IMAGE_EXTENSION,
+                )
+                tile_path = output_dir / filename
+                cache_key = _cache_key(
+                    ImageryProviderKey.MAPTILER_SATELLITE.value,
+                    lat,
+                    lon,
+                    degree_span,
+                    zoom,
+                    tile_pixels,
+                    date or "",
+                )
+
+                cached_metadata = cache.load(cache_key, MAPTILER_IMAGE_EXTENSION, tile_path)
+                if cached_metadata is not None:
+                    tiles.append(
+                        _area_tile_from_metadata(
+                            lat=lat,
+                            lon=lon,
+                            path=tile_path,
+                            metadata=cached_metadata,
+                            default_layer=MAPTILER_STYLE,
+                            default_provider=ImageryProviderKey.MAPTILER_SATELLITE,
+                            default_label=provider_label,
+                            default_degree_size=degree_span,
+                            fallback_pixels=tile_pixels,
+                            default_native_dim=native_dim,
+                            default_pixels_per_degree=MAPTILER_PIXELS_PER_DEGREE,
+                        )
+                    )
+                    continue
+
+                await _respect_rate_limit()
                 try:
-                    image_bytes, rendered_pixels, source_detail = await _maptiler_render_tile_image(
+                    (
+                        image_bytes,
+                        rendered_pixels,
+                        source_detail,
+                        request_count,
+                    ) = await _maptiler_render_tile_image(
                         client=client,
                         api_key=api_key,
                         headers=request_headers,
@@ -323,14 +478,6 @@ async def download_maptiler_area_tiles(
                     logger.warning("MapTiler imagery request failed: %s", detail)
                     continue
 
-                filename = _tile_filename(
-                    lat,
-                    lon,
-                    date,
-                    prefix="maptiler",
-                    extension=MAPTILER_IMAGE_EXTENSION,
-                )
-                tile_path = output_dir / filename
                 tile_path.write_bytes(image_bytes)
 
                 pixel_size = _actual_tile_size(tile_path, rendered_pixels)
@@ -344,20 +491,36 @@ async def download_maptiler_area_tiles(
                     north=north_bound,
                 )
 
+                metadata = {
+                    "provider": ImageryProviderKey.MAPTILER_SATELLITE.value,
+                    "provider_label": provider_label,
+                    "pixel_size": pixel_size,
+                    "degree_size": degree_span,
+                    "source_url": source_url,
+                    "layer": MAPTILER_STYLE,
+                    "native_dim": native_dim,
+                    "pixels_per_degree": pixels_per_degree or MAPTILER_PIXELS_PER_DEGREE,
+                    "layer_description": MAPTILER_LAYER_DESCRIPTION,
+                }
+                cache.store(cache_key, MAPTILER_IMAGE_EXTENSION, image_bytes, metadata)
+                record_api_usage(
+                    ImageryProviderKey.MAPTILER_SATELLITE.value,
+                    increment=max(1, int(request_count)),
+                )
+
                 tiles.append(
-                    AreaTile(
+                    _area_tile_from_metadata(
                         lat=lat,
                         lon=lon,
                         path=tile_path,
-                        source_url=source_url,
-                        pixel_size=pixel_size,
-                        degree_size=degree_span,
-                        layer=MAPTILER_STYLE,
-                        native_dim=native_dim,
-                        pixels_per_degree=pixels_per_degree or MAPTILER_PIXELS_PER_DEGREE,
-                        layer_description=MAPTILER_LAYER_DESCRIPTION,
-                        provider=ImageryProviderKey.MAPTILER_SATELLITE.value,
-                        provider_label=provider_label,
+                        metadata=metadata,
+                        default_layer=MAPTILER_STYLE,
+                        default_provider=ImageryProviderKey.MAPTILER_SATELLITE,
+                        default_label=provider_label,
+                        default_degree_size=degree_span,
+                        fallback_pixels=rendered_pixels,
+                        default_native_dim=native_dim,
+                        default_pixels_per_degree=MAPTILER_PIXELS_PER_DEGREE,
                     )
                 )
 
@@ -505,6 +668,7 @@ async def download_naip_area_tiles(
     failures: List[str] = []
     native_dim = max(MIN_DIM, NAIP_MIN_TILE_PIXELS / NAIP_PIXELS_PER_DEGREE)
     provider_label = PROVIDER_METADATA[ImageryProviderKey.USGS_NAIP]["label"]
+    cache = _get_tile_cache()
 
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for lat in lat_centers:
@@ -549,6 +713,46 @@ async def download_naip_area_tiles(
                     "WIDTH": width,
                     "HEIGHT": height,
                 }
+
+                degree_span = max(dim, lat_span, lon_span)
+                filename = _tile_filename(
+                    lat,
+                    lon,
+                    date,
+                    prefix="naip",
+                    extension=".jpg",
+                )
+                tile_path = output_dir / filename
+                cache_key = _cache_key(
+                    ImageryProviderKey.USGS_NAIP.value,
+                    lat,
+                    lon,
+                    degree_span,
+                    width,
+                    height,
+                    date or "",
+                )
+
+                cached_metadata = cache.load(cache_key, ".jpg", tile_path)
+                if cached_metadata is not None:
+                    tiles.append(
+                        _area_tile_from_metadata(
+                            lat=lat,
+                            lon=lon,
+                            path=tile_path,
+                            metadata=cached_metadata,
+                            default_layer="USGSNAIPPlus",
+                            default_provider=ImageryProviderKey.USGS_NAIP,
+                            default_label=provider_label,
+                            default_degree_size=degree_span,
+                            fallback_pixels=max(width, height),
+                            default_native_dim=native_dim,
+                            default_pixels_per_degree=NAIP_PIXELS_PER_DEGREE,
+                        )
+                    )
+                    continue
+
+                await _respect_rate_limit()
 
                 request_attempts = [
                     # WMS 1.3.0 swaps the axis order for EPSG:4326 compared to the legacy
@@ -648,14 +852,6 @@ async def download_naip_area_tiles(
                     failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {error_message}")
                     continue
 
-                filename = _tile_filename(
-                    lat,
-                    lon,
-                    date,
-                    prefix="naip",
-                    extension=".jpg",
-                )
-                tile_path = output_dir / filename
                 tile_path.write_bytes(response.content)
 
                 pixel_size = _actual_tile_size(tile_path, max(width, height))
@@ -663,20 +859,33 @@ async def download_naip_area_tiles(
                 lat_resolution = height / lat_span if lat_span > 0 else 0.0
                 pixels_per_degree = max(lon_resolution, lat_resolution, 0.0)
 
+                metadata = {
+                    "provider": ImageryProviderKey.USGS_NAIP.value,
+                    "provider_label": provider_label,
+                    "pixel_size": pixel_size,
+                    "degree_size": degree_span,
+                    "source_url": str(response.url),
+                    "layer": "USGSNAIPPlus",
+                    "native_dim": native_dim,
+                    "pixels_per_degree": pixels_per_degree or NAIP_PIXELS_PER_DEGREE,
+                    "layer_description": "USGS NAIP Plus aerial imagery (~1 m)",
+                }
+                cache.store(cache_key, ".jpg", response.content, metadata)
+                record_api_usage(ImageryProviderKey.USGS_NAIP.value, increment=1)
+
                 tiles.append(
-                    AreaTile(
+                    _area_tile_from_metadata(
                         lat=lat,
                         lon=lon,
                         path=tile_path,
-                        source_url=str(response.url),
-                        pixel_size=pixel_size,
-                        degree_size=max(dim, lat_span, lon_span),
-                        layer="USGSNAIPPlus",
-                        native_dim=native_dim,
-                        pixels_per_degree=pixels_per_degree,
-                        layer_description="USGS NAIP Plus aerial imagery (~1 m)",
-                        provider=ImageryProviderKey.USGS_NAIP.value,
-                        provider_label=provider_label,
+                        metadata=metadata,
+                        default_layer="USGSNAIPPlus",
+                        default_provider=ImageryProviderKey.USGS_NAIP,
+                        default_label=provider_label,
+                        default_degree_size=degree_span,
+                        fallback_pixels=max(width, height),
+                        default_native_dim=native_dim,
+                        default_pixels_per_degree=pixels_per_degree or NAIP_PIXELS_PER_DEGREE,
                     )
                 )
 
@@ -804,6 +1013,9 @@ async def _download_tiles_for_dim(
     tiles: List[AreaTile] = []
     failures: List[str] = []
     tile_pixels = _tile_pixel_size(dim, layer)
+    cache = _get_tile_cache()
+    provider_label = PROVIDER_METADATA[ImageryProviderKey.NASA_GIBS]["label"]
+    native_dim = _minimum_native_tile_dim(layer)
 
     for lat in lat_centers:
         for lon in lon_centers:
@@ -824,6 +1036,40 @@ async def _download_tiles_for_dim(
 
             if time_param:
                 params["TIME"] = time_param
+
+            filename = _tile_filename(lat, lon, date)
+            tile_path = output_dir / filename
+            cache_key = _cache_key(
+                ImageryProviderKey.NASA_GIBS.value,
+                layer.name,
+                lat,
+                lon,
+                dim,
+                tile_pixels,
+                time_param or "",
+                date or "",
+            )
+
+            cached_metadata = cache.load(cache_key, ".png", tile_path)
+            if cached_metadata is not None:
+                tiles.append(
+                    _area_tile_from_metadata(
+                        lat=lat,
+                        lon=lon,
+                        path=tile_path,
+                        metadata=cached_metadata,
+                        default_layer=layer.name,
+                        default_provider=ImageryProviderKey.NASA_GIBS,
+                        default_label=provider_label,
+                        default_degree_size=dim,
+                        fallback_pixels=tile_pixels,
+                        default_native_dim=native_dim,
+                        default_pixels_per_degree=layer.pixels_per_degree,
+                    )
+                )
+                continue
+
+            await _respect_rate_limit()
 
             try:
                 response = await client.get(GIBS_WMS_URL, params=params)
@@ -857,24 +1103,35 @@ async def _download_tiles_for_dim(
                 )
                 continue
 
-            filename = _tile_filename(lat, lon, date)
-            tile_path = output_dir / filename
             tile_path.write_bytes(response.content)
             pixel_size = _actual_tile_size(tile_path, tile_pixels)
+            metadata = {
+                "provider": ImageryProviderKey.NASA_GIBS.value,
+                "provider_label": provider_label,
+                "pixel_size": pixel_size,
+                "degree_size": dim,
+                "source_url": str(response.url),
+                "layer": layer.name,
+                "native_dim": native_dim,
+                "pixels_per_degree": layer.pixels_per_degree,
+                "layer_description": layer.description,
+                "time_param": time_param,
+            }
+            cache.store(cache_key, ".png", response.content, metadata)
+            record_api_usage(ImageryProviderKey.NASA_GIBS.value, increment=1)
             tiles.append(
-                AreaTile(
+                _area_tile_from_metadata(
                     lat=lat,
                     lon=lon,
                     path=tile_path,
-                    source_url=str(response.url),
-                    pixel_size=pixel_size,
-                    degree_size=dim,
-                    layer=layer.name,
-                    native_dim=_minimum_native_tile_dim(layer),
-                    pixels_per_degree=layer.pixels_per_degree,
-                    layer_description=layer.description,
-                    provider=ImageryProviderKey.NASA_GIBS.value,
-                    provider_label=PROVIDER_METADATA[ImageryProviderKey.NASA_GIBS]["label"],
+                    metadata=metadata,
+                    default_layer=layer.name,
+                    default_provider=ImageryProviderKey.NASA_GIBS,
+                    default_label=provider_label,
+                    default_degree_size=dim,
+                    fallback_pixels=tile_pixels,
+                    default_native_dim=native_dim,
+                    default_pixels_per_degree=layer.pixels_per_degree,
                 )
             )
 
@@ -1245,7 +1502,8 @@ async def _maptiler_render_tile_image(
 
     buffer = io.BytesIO()
     mosaic.save(buffer, format="JPEG", quality=MAPTILER_JPEG_QUALITY)
-    return buffer.getvalue(), mosaic.size[0], _summarize_maptiler_urls(urls)
+    request_count = max(1, len(urls))
+    return buffer.getvalue(), mosaic.size[0], _summarize_maptiler_urls(urls), request_count
 
 
 async def _maptiler_download_tile_mosaic(

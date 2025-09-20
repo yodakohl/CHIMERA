@@ -64,6 +64,24 @@ h1 {
   transform: translateY(-1px);
 }
 
+.form-card .secondary-button {
+  background: transparent;
+  border: 1px solid rgba(95, 137, 255, 0.6);
+  color: inherit;
+}
+
+.form-card .secondary-button:hover {
+  background-color: rgba(95, 137, 255, 0.12);
+}
+
+.form-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
 .form-grid {
   display: grid;
   gap: 1rem;

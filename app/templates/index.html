@@ -101,8 +101,8 @@
               name="tile_size"
               type="number"
               step="0.01"
-              min="0.01"
-              max="0.5"
+              min="{{ '%.2f'|format(min_tile_size) }}"
+              max="{{ '%.2f'|format(max_tile_size) }}"
               value="{{ '%.2f'|format(default_tile_size) }}"
               required
             />
@@ -132,6 +132,14 @@
             />
           </div>
         </div>
+        <div class="form-actions">
+          <button type="button" id="global-scan" class="secondary-button">
+            Use worldwide coverage
+          </button>
+          <span class="hint">
+            Prefills the form with global bounds and the largest supported tile size.
+          </span>
+        </div>
         <p class="hint">
           Large areas may require increasing the tile size to stay under the built-in limit of 50
           imagery requests per scan.
@@ -142,6 +150,38 @@
 
         <button type="submit">Scan area</button>
       </form>
+    </section>
+
+    <section class="usage results">
+      <h2>API usage</h2>
+      {% if api_usage %}
+      <table>
+        <thead>
+          <tr>
+            <th>Provider</th>
+            <th>Requests</th>
+            <th>Last used</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for entry in api_usage %}
+          <tr>
+            <td>{{ entry.provider_label }}</td>
+            <td>{{ entry.request_count }}</td>
+            <td>
+              {% if entry.last_used_at %}
+              {{ entry.last_used_at.strftime('%Y-%m-%d %H:%M:%S') }}
+              {% else %}
+              &mdash;
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p>No API requests have been recorded yet.</p>
+      {% endif %}
     </section>
 
     <section class="results">
@@ -201,5 +241,23 @@
       <p>No analyses have been recorded yet. Upload your first satellite scene to begin.</p>
       {% endif %}
     </section>
+    <script>
+      (function () {
+        const button = document.getElementById("global-scan");
+        if (!button) return;
+        button.addEventListener("click", function () {
+          const north = document.getElementById("north");
+          const south = document.getElementById("south");
+          const east = document.getElementById("east");
+          const west = document.getElementById("west");
+          const tile = document.getElementById("tile-size");
+          if (north) north.value = "90";
+          if (south) south.value = "-90";
+          if (east) east.value = "180";
+          if (west) west.value = "-180";
+          if (tile) tile.value = "{{ '%.2f'|format(max_tile_size) }}";
+        });
+      })();
+    </script>
   </body>
 </html>
