@@ -774,18 +774,22 @@ def _unusual_summary_score(summary: str | None) -> int:
 
 def _analysis_sort_key(
     result: AnalysisResult, detections: List[Dict[str, object]]
-) -> tuple[int, int, datetime]:
+) -> tuple[datetime, int, int]:
+    """Return a tuple prioritising recency while keeping interesting ties first."""
+
+    timestamp = result.created_at or datetime.min
     summary_score = _unusual_summary_score(result.unusual_summary)
     detection_score = len(detections)
-    timestamp = result.created_at or datetime.min
-    return (summary_score, detection_score, timestamp)
+    return (timestamp, summary_score, detection_score)
 
 
 def _build_results(session: Session) -> List[Dict[str, object]]:
     statement = select(AnalysisResult)
     results: List[AnalysisResult] = session.exec(statement).all()
 
-    decorated: List[tuple[tuple[int, int, datetime], AnalysisResult, List[Dict[str, object]]]] = []
+    decorated: List[
+        tuple[tuple[datetime, int, int], AnalysisResult, List[Dict[str, object]]]
+    ] = []
     for result in results:
         detections = result.detections()
         sort_key = _analysis_sort_key(result, detections)
