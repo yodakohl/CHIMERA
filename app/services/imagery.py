@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
@@ -52,6 +53,18 @@ NAIP_COVERAGE_NOTE = (
     f"{NAIP_COVERAGE_LON_RANGE[0]:.1f}°–{NAIP_COVERAGE_LON_RANGE[1]:.1f}° longitude)."
 )
 
+MAPTILER_BASE_URL = "https://api.maptiler.com/maps"
+MAPTILER_STYLE = "satellite"
+MAPTILER_IMAGE_EXTENSION = "jpg"
+MAPTILER_IMAGE_FORMAT = "image/jpeg"
+MAPTILER_API_KEY_ENV = "MAPTILER_API_KEY"
+MAPTILER_PIXELS_PER_DEGREE = 36000
+MAPTILER_MIN_TILE_PIXELS = 512
+MAPTILER_MAX_TILE_PIXELS = 2048
+MAPTILER_LATITUDE_LIMIT = 85.05112878
+MAPTILER_MAX_ZOOM = 20
+MAPTILER_LAYER_DESCRIPTION = "MapTiler satellite basemap (global high-res)"
+
 RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
 
@@ -64,6 +77,7 @@ REQUEST_TIMEOUT = httpx.Timeout(60.0)
 class ImageryProviderKey(str, Enum):
     """Identifiers for the supported remote sensing providers."""
 
+    MAPTILER_SATELLITE = "maptiler_satellite"
     NASA_GIBS = "nasa_gibs"
     USGS_NAIP = "usgs_naip"
 
@@ -72,6 +86,13 @@ ProviderMetadata = Dict[str, str]
 
 
 PROVIDER_METADATA: Dict[ImageryProviderKey, ProviderMetadata] = {
+    ImageryProviderKey.MAPTILER_SATELLITE: {
+        "label": "MapTiler Satellite (global high-res)",
+        "description": (
+            "Global satellite basemap from MapTiler. Requires the MAPTILER_API_KEY environment "
+            "variable to be configured."
+        ),
+    },
     ImageryProviderKey.NASA_GIBS: {
         "label": "NASA GIBS (global satellite mosaics)",
         "description": "Worldwide coverage using VIIRS imagery with automatic Landsat WELD fallback (~30 m).",
@@ -154,6 +175,16 @@ async def download_area_tiles(
     if isinstance(provider, str):  # pragma: no cover - defensive for direct calls
         provider = ImageryProviderKey(provider)
 
+    if provider == ImageryProviderKey.MAPTILER_SATELLITE:
+        return await download_maptiler_area_tiles(
+            north=north,
+            south=south,
+            east=east,
+            west=west,
+            dim=dim,
+            output_dir=output_dir,
+            date=date,
+        )
     if provider == ImageryProviderKey.NASA_GIBS:
         return await download_gibs_area_tiles(
             north=north,
@@ -176,6 +207,145 @@ async def download_area_tiles(
         )
 
     raise ValueError(f"Unsupported imagery provider: {provider}")
+
+
+async def download_maptiler_area_tiles(
+    *,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    dim: float,
+    output_dir: Path,
+    date: str | None = None,
+) -> Tuple[List[AreaTile], List[str]]:
+    """Download satellite tiles from the MapTiler static imagery API."""
+
+    _validate_bounds(north=north, south=south, east=east, west=west)
+    _validate_dim(dim)
+
+    api_key = os.getenv(MAPTILER_API_KEY_ENV)
+    if not api_key:
+        raise ValueError(
+            "MapTiler imagery requires the MAPTILER_API_KEY environment variable to be set."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    lat_centers = _build_axis_centers(
+        minimum=south,
+        maximum=north,
+        dim=dim,
+        clamp_min=-90.0 + dim / 2,
+        clamp_max=90.0 - dim / 2,
+    )
+    lon_centers = _build_axis_centers(
+        minimum=west,
+        maximum=east,
+        dim=dim,
+        clamp_min=-180.0 + dim / 2,
+        clamp_max=180.0 - dim / 2,
+    )
+
+    total_tiles = len(lat_centers) * len(lon_centers)
+    if total_tiles > MAX_TILES_PER_RUN:
+        raise ValueError(
+            "Requested area requires "
+            f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
+            f"the limit of {MAX_TILES_PER_RUN} requests per scan."
+        )
+
+    provider_label = PROVIDER_METADATA[ImageryProviderKey.MAPTILER_SATELLITE]["label"]
+    tiles: List[AreaTile] = []
+    failures: List[str] = []
+    native_dim = _maptiler_native_dim()
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        for lat in lat_centers:
+            for lon in lon_centers:
+                south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+                degree_span = max(dim, north_bound - south_bound, east_bound - west_bound, MIN_DIM)
+                tile_pixels = _maptiler_tile_pixels(degree_span)
+                zoom = _maptiler_zoom_level(
+                    north=north_bound,
+                    south=south_bound,
+                    east=east_bound,
+                    west=west_bound,
+                    width=tile_pixels,
+                    height=tile_pixels,
+                )
+
+                url = (
+                    f"{MAPTILER_BASE_URL}/{MAPTILER_STYLE}/static/"
+                    f"{lon:.6f},{lat:.6f},{zoom}/{tile_pixels}x{tile_pixels}.{MAPTILER_IMAGE_EXTENSION}"
+                )
+
+                try:
+                    response = await client.get(
+                        url,
+                        params={"key": api_key, "attribution": "false"},
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail = _short_error_detail(exc.response.text)
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
+                    )
+                    logger.warning(
+                        "MapTiler imagery request failed with status %s: %s",
+                        exc.response.status_code,
+                        detail,
+                    )
+                    continue
+                except httpx.RequestError as exc:
+                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
+                    logger.warning("MapTiler imagery request error: %s", exc)
+                    continue
+
+                if not _is_image_response(response):
+                    content_type = response.headers.get("Content-Type", "unknown")
+                    detail = _short_error_detail(response.text)
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
+                    )
+                    logger.warning(
+                        "MapTiler imagery request returned non-image payload (%s): %s",
+                        content_type,
+                        detail,
+                    )
+                    continue
+
+                filename = _tile_filename(
+                    lat,
+                    lon,
+                    date,
+                    prefix="maptiler",
+                    extension=MAPTILER_IMAGE_EXTENSION,
+                )
+                tile_path = output_dir / filename
+                tile_path.write_bytes(response.content)
+
+                pixel_size = _actual_tile_size(tile_path, tile_pixels)
+                pixels_per_degree = pixel_size / degree_span if degree_span > 0 else 0.0
+
+                tiles.append(
+                    AreaTile(
+                        lat=lat,
+                        lon=lon,
+                        path=tile_path,
+                        source_url=str(response.url),
+                        pixel_size=pixel_size,
+                        degree_size=degree_span,
+                        layer=MAPTILER_STYLE,
+                        native_dim=native_dim,
+                        pixels_per_degree=pixels_per_degree or MAPTILER_PIXELS_PER_DEGREE,
+                        layer_description=MAPTILER_LAYER_DESCRIPTION,
+                        provider=ImageryProviderKey.MAPTILER_SATELLITE.value,
+                        provider_label=provider_label,
+                    )
+                )
+
+    return tiles, failures
 
 
 async def download_gibs_area_tiles(
@@ -1012,6 +1182,45 @@ def _tile_pixel_size(dim: float, layer: GibsLayerConfig) -> int:
         estimated_pixels += 1
     estimated_pixels = min(estimated_pixels, layer.max_tile_pixels)
     return int(estimated_pixels)
+
+
+def _maptiler_tile_pixels(degree_span: float) -> int:
+    estimated = max(int(round(degree_span * MAPTILER_PIXELS_PER_DEGREE)), MAPTILER_MIN_TILE_PIXELS)
+    if estimated % 2:
+        estimated += 1
+    return min(estimated, MAPTILER_MAX_TILE_PIXELS)
+
+
+def _maptiler_zoom_level(
+    *, north: float, south: float, east: float, west: float, width: int, height: int
+) -> int:
+    lon_span = max(east - west, 1e-9)
+    lon_fraction = lon_span / 360.0
+
+    def _mercator_fraction(lat: float) -> float:
+        clamped = _clamp(lat, -MAPTILER_LATITUDE_LIMIT, MAPTILER_LATITUDE_LIMIT)
+        sin_lat = math.sin(math.radians(clamped))
+        return 0.5 - math.log((1 + sin_lat) / (1 - sin_lat)) / (4 * math.pi)
+
+    north_fraction = _mercator_fraction(north)
+    south_fraction = _mercator_fraction(south)
+    lat_fraction = max(abs(north_fraction - south_fraction), 1e-9)
+
+    width = max(width, 1)
+    height = max(height, 1)
+
+    zoom_x = math.log2(width / (256 * lon_fraction))
+    zoom_y = math.log2(height / (256 * lat_fraction))
+    zoom = min(zoom_x, zoom_y)
+    if not math.isfinite(zoom):
+        zoom = MAPTILER_MAX_ZOOM
+
+    zoom = max(0.0, min(float(MAPTILER_MAX_ZOOM), zoom))
+    return int(math.floor(zoom))
+
+
+def _maptiler_native_dim() -> float:
+    return max(MIN_DIM, MAPTILER_MIN_TILE_PIXELS / MAPTILER_PIXELS_PER_DEGREE)
 
 
 def _naip_tile_pixels(span: float) -> int:
