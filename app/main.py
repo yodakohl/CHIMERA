@@ -43,8 +43,8 @@ DEFAULT_SCAN_BOUNDS = {
     "west": 16.3588,
     "east": 16.3888,
 }
-# A 0.03° tile size provides a single high-resolution tile for the Vienna default area.
-DEFAULT_SCAN_TILE_SIZE = 0.03
+# A 0.01° tile size keeps the default Vienna area focused while providing more detail by default.
+DEFAULT_SCAN_TILE_SIZE = 0.01
 DEFAULT_SCAN_DATE: str | None = None
 DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.MAPTILER_SATELLITE
 

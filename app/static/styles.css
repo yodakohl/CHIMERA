@@ -29,6 +29,72 @@ h1 {
   margin-bottom: 2.5rem;
 }
 
+.upload-toggle {
+  display: block;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 2.5rem;
+  overflow: hidden;
+}
+
+.upload-toggle summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 1.1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-weight: 600;
+}
+
+.upload-toggle summary:hover {
+  background-color: rgba(95, 137, 255, 0.12);
+}
+
+.upload-toggle[open] summary {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+.upload-toggle summary::-webkit-details-marker {
+  display: none;
+}
+
+.upload-toggle summary::after {
+  content: "▸";
+  font-size: 1.1rem;
+  opacity: 0.75;
+  transition: transform 0.2s ease;
+}
+
+.upload-toggle[open] summary::after {
+  transform: rotate(90deg);
+}
+
+.summary-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.summary-title {
+  font-size: 1.05rem;
+}
+
+.summary-description {
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.upload-toggle .form-card {
+  margin: 0;
+  border-radius: 0;
+  background-color: rgba(255, 255, 255, 0.04);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 .form-card input,
 .form-card textarea {
   padding: 0.75rem;
@@ -104,6 +170,57 @@ h1 {
   gap: 0.5rem;
 }
 
+.field-full {
+  grid-column: 1 / -1;
+}
+
+.field-label {
+  font-weight: 600;
+}
+
+.map-field {
+  gap: 0.75rem;
+}
+
+.scan-map {
+  height: 320px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.scan-map .leaflet-control-container .leaflet-control {
+  background-color: rgba(11, 18, 32, 0.85);
+  color: #e6edf7;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.scan-map .leaflet-bar a {
+  color: inherit;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.scan-map .leaflet-bar a:last-child {
+  border-bottom: none;
+}
+
+.scan-map .leaflet-bar a:hover {
+  background-color: rgba(95, 137, 255, 0.2);
+}
+
+.leaflet-marker-icon.map-handle {
+  background: linear-gradient(135deg, #5f89ff, #a855f7);
+  border: 2px solid rgba(11, 18, 32, 0.8);
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px rgba(95, 137, 255, 0.3);
+  cursor: grab;
+}
+
+.leaflet-marker-icon.map-handle.leaflet-dragging,
+.leaflet-marker-icon.map-handle:active {
+  cursor: grabbing;
+}
+
 .form-card .hint {
   font-size: 0.9rem;
   opacity: 0.8;
@@ -138,6 +255,46 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}
+
+.scan-gallery {
+  display: none;
+  margin-top: 1.5rem;
+  padding: 1.25rem 1.5rem;
+  background-color: rgba(255, 255, 255, 0.04);
+  border-radius: 12px;
+}
+
+.scan-gallery.visible {
+  display: block;
+}
+
+.thumbnail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.scan-thumbnail {
+  display: block;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background-color: rgba(11, 18, 32, 0.7);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.3);
+}
+
+.scan-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.scan-thumbnail:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.35);
 }
 
 .scan-events li {
@@ -219,6 +376,34 @@ h1 {
 
 .results li {
   margin-bottom: 0.75rem;
+}
+
+.image-cell .image-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  text-decoration: none;
+  color: inherit;
+}
+
+.image-cell .image-link span {
+  word-break: break-word;
+}
+
+.image-cell .image-link:focus {
+  outline: 2px solid rgba(95, 137, 255, 0.6);
+  outline-offset: 4px;
+}
+
+.tile-thumbnail {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  background-color: rgba(11, 18, 32, 0.6);
+  flex-shrink: 0;
 }
 
 .results .meta {

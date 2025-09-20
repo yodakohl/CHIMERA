@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Satellite Infrastructure Scanner</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -21,15 +25,26 @@
     {% endif %}
 
     <section class="upload">
-      <form class="form-card" action="/analyze" method="post" enctype="multipart/form-data">
-        <label for="image">Satellite image</label>
-        <input id="image" name="image" type="file" accept="image/*" required />
+      <details class="upload-toggle">
+        <summary>
+          <div class="summary-content">
+            <span class="summary-title">Analyze a single image</span>
+            <span class="summary-description"
+              >Upload an individual scene when you don't need a full area
+              scan.</span
+            >
+          </div>
+        </summary>
+        <form class="form-card" action="/analyze" method="post" enctype="multipart/form-data">
+          <label for="image">Satellite image</label>
+          <input id="image" name="image" type="file" accept="image/*" required />
 
-        <label for="prompt">Analysis prompt</label>
-        <textarea id="prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
+          <label for="prompt">Analysis prompt</label>
+          <textarea id="prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
 
-        <button type="submit">Analyze image</button>
-      </form>
+          <button type="submit">Analyze image</button>
+        </form>
+      </details>
     </section>
 
     <section class="area">
@@ -93,6 +108,14 @@
               value="{{ '%.4f'|format(default_bounds.east) }}"
               required
             />
+          </div>
+          <div class="field field-full map-field">
+            <span class="field-label">Select scan area</span>
+            <div id="scan-map" class="scan-map" aria-describedby="map-hint"></div>
+            <p class="hint" id="map-hint">
+              Drag the corner handles to adjust the bounding box or edit the
+              coordinates directly.
+            </p>
           </div>
           <div class="field">
             <label for="tile-size">Tile size (degrees)</label>
@@ -160,6 +183,13 @@
         <p class="hint">Updates appear as each tile is downloaded and analyzed.</p>
         <ul id="scan-events" class="scan-events"></ul>
       </div>
+      <div class="scan-gallery" id="scan-gallery">
+        <h3>Scanned tile thumbnails</h3>
+        <p class="hint">
+          Preview the most recent imagery tiles analyzed during the current scan.
+        </p>
+        <div class="thumbnail-grid" id="scan-thumbnails"></div>
+      </div>
     </section>
 
     <section class="usage results">
@@ -211,10 +241,22 @@
           {% for result in results %}
           <tr>
             <td>{{ result.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-            <td>
-              <a href="/data/uploads/{{ result.image_filename }}" target="_blank">
-                {{ result.image_filename }}
+            <td class="image-cell">
+              {% if result.image_filename %}
+              {% set image_url = '/data/uploads/' ~ result.image_filename %}
+              {% set image_label = result.image_filename.rsplit('/', 1)[-1] %}
+              <a href="{{ image_url }}" target="_blank" class="image-link">
+                <img
+                  src="{{ image_url }}"
+                  alt="{{ image_label }}"
+                  class="tile-thumbnail"
+                  loading="lazy"
+                />
+                <span>{{ image_label }}</span>
               </a>
+              {% else %}
+              <em>No image available</em>
+              {% endif %}
             </td>
             <td>{{ result.caption }}</td>
             <td>{{ result.unusual_summary }}</td>
@@ -251,6 +293,7 @@
       <p>No analyses have been recorded yet. Upload your first satellite scene to begin.</p>
       {% endif %}
     </section>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
       (function () {
         const form = document.getElementById("area-scan-form");
@@ -260,9 +303,44 @@
         const eventsList = document.getElementById("scan-events");
         const progressSection = document.getElementById("scan-progress");
         const historyTable = document.querySelector(".results table tbody");
+        const gallerySection = document.getElementById("scan-gallery");
+        const thumbnailGrid = document.getElementById("scan-thumbnails");
+        const boundsInputs = {
+          north: document.getElementById("north"),
+          south: document.getElementById("south"),
+          east: document.getElementById("east"),
+          west: document.getElementById("west"),
+        };
+
+        let refreshBoundsFromInputs = () => {};
         let eventSource = null;
         let activeScanId = null;
         let tileCounter = 0;
+
+        function getBoundsFromInputs() {
+          if (!window.L || typeof window.L.latLngBounds !== "function") {
+            return null;
+          }
+          const north = boundsInputs.north ? parseFloat(boundsInputs.north.value) : NaN;
+          const south = boundsInputs.south ? parseFloat(boundsInputs.south.value) : NaN;
+          const east = boundsInputs.east ? parseFloat(boundsInputs.east.value) : NaN;
+          const west = boundsInputs.west ? parseFloat(boundsInputs.west.value) : NaN;
+          if ([north, south, east, west].some((value) => Number.isNaN(value))) {
+            return null;
+          }
+          const normalizedNorth = Math.max(north, south);
+          const normalizedSouth = Math.min(north, south);
+          const normalizedEast = Math.max(east, west);
+          const normalizedWest = Math.min(east, west);
+          return L.latLngBounds(
+            [
+              [normalizedSouth, normalizedWest],
+              [normalizedNorth, normalizedEast],
+            ]
+          );
+        }
+
+        initializeMap();
 
         function safeParse(data) {
           try {
@@ -279,6 +357,12 @@
           }
           if (progressSection) {
             progressSection.classList.remove("visible");
+          }
+          if (thumbnailGrid) {
+            thumbnailGrid.innerHTML = "";
+          }
+          if (gallerySection) {
+            gallerySection.classList.remove("visible");
           }
         }
 
@@ -300,6 +384,38 @@
           eventsList.prepend(item);
           if (progressSection) {
             progressSection.classList.add("visible");
+          }
+        }
+
+        function getFileNameFromPath(path) {
+          if (typeof path !== "string") return "";
+          const parts = path.split("/").filter(Boolean);
+          return parts.length ? parts[parts.length - 1] : path;
+        }
+
+        function addThumbnail(tile) {
+          if (!thumbnailGrid || !tile || !tile.image) {
+            return;
+          }
+          const link = document.createElement("a");
+          link.href = tile.image;
+          link.target = "_blank";
+          link.className = "scan-thumbnail";
+
+          const img = document.createElement("img");
+          img.src = tile.image;
+          img.alt = tile.caption || getFileNameFromPath(tile.image) || "Tile";
+          img.loading = "lazy";
+
+          link.appendChild(img);
+          thumbnailGrid.prepend(link);
+
+          while (thumbnailGrid.childElementCount > 12) {
+            thumbnailGrid.removeChild(thumbnailGrid.lastElementChild);
+          }
+
+          if (gallerySection) {
+            gallerySection.classList.add("visible");
           }
         }
 
@@ -328,11 +444,24 @@
           row.appendChild(timestampCell);
 
           const imageCell = document.createElement("td");
+          imageCell.className = "image-cell";
           if (tile.image) {
             const link = document.createElement("a");
             link.href = tile.image;
             link.target = "_blank";
-            link.textContent = tile.image.split("/").pop() || "Tile";
+            link.className = "image-link";
+
+            const thumbnail = document.createElement("img");
+            thumbnail.src = tile.image;
+            thumbnail.alt = getFileNameFromPath(tile.image) || "Tile";
+            thumbnail.className = "tile-thumbnail";
+            thumbnail.loading = "lazy";
+
+            const label = document.createElement("span");
+            label.textContent = getFileNameFromPath(tile.image) || "Tile";
+
+            link.appendChild(thumbnail);
+            link.appendChild(label);
             imageCell.appendChild(link);
           } else {
             imageCell.textContent = "Tile";
@@ -387,6 +516,9 @@
             if (east) east.value = "180";
             if (west) west.value = "-180";
             if (tile) tile.value = "{{ '%.2f'|format(max_tile_size) }}";
+            if (typeof refreshBoundsFromInputs === "function") {
+              refreshBoundsFromInputs();
+            }
           });
         }
 
@@ -404,9 +536,9 @@
             });
 
             activeScanId =
-              (window.crypto && typeof window.crypto.randomUUID === "function"
+              window.crypto && typeof window.crypto.randomUUID === "function"
                 ? window.crypto.randomUUID()
-                : `scan-${Date.now()}`);
+                : `scan-${Date.now()}`;
             params.append("scan_id", activeScanId);
 
             const url = `/scan-area/stream?${params.toString()}`;
@@ -432,6 +564,7 @@
               const caption = payload.caption || "Tile analyzed.";
               appendEvent(`Tile #${index}: ${caption}`, "success");
               updateHistoryTable(payload);
+              addThumbnail(payload);
             });
 
             eventSource.addEventListener("download-failed", (evt) => {
@@ -493,6 +626,191 @@
             setRunning(false);
             closeSource();
           });
+        }
+
+        function initializeMap() {
+          const container = document.getElementById("scan-map");
+          if (!container || !window.L || typeof window.L.map !== "function") {
+            return;
+          }
+
+          const map = L.map(container, {
+            zoomControl: true,
+            attributionControl: true,
+          });
+
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            attribution: "© OpenStreetMap contributors",
+            maxZoom: 19,
+          }).addTo(map);
+
+          const rectangleOptions = {
+            color: "#5f89ff",
+            weight: 1.5,
+            fillOpacity: 0.08,
+          };
+
+          function boundsToObject(bounds) {
+            return {
+              north: bounds.getNorth(),
+              south: bounds.getSouth(),
+              east: bounds.getEast(),
+              west: bounds.getWest(),
+            };
+          }
+
+          function objectToLatLngBounds(boundsObject) {
+            return L.latLngBounds(
+              [
+                [boundsObject.south, boundsObject.west],
+                [boundsObject.north, boundsObject.east],
+              ]
+            );
+          }
+
+          const defaultBounds = getBoundsFromInputs();
+          let currentBounds = defaultBounds
+            ? boundsToObject(defaultBounds)
+            : { north: 10, south: -10, east: 10, west: -10 };
+
+          let rectangle = L.rectangle(
+            objectToLatLngBounds(currentBounds),
+            rectangleOptions
+          ).addTo(map);
+
+          const handleIcon = L.divIcon({
+            className: "map-handle",
+            iconSize: [16, 16],
+            iconAnchor: [8, 8],
+          });
+
+          const handles = {
+            northWest: L.marker(
+              [currentBounds.north, currentBounds.west],
+              { draggable: true, icon: handleIcon }
+            ),
+            northEast: L.marker(
+              [currentBounds.north, currentBounds.east],
+              { draggable: true, icon: handleIcon }
+            ),
+            southWest: L.marker(
+              [currentBounds.south, currentBounds.west],
+              { draggable: true, icon: handleIcon }
+            ),
+            southEast: L.marker(
+              [currentBounds.south, currentBounds.east],
+              { draggable: true, icon: handleIcon }
+            ),
+          };
+
+          Object.values(handles).forEach((marker) => marker.addTo(map));
+
+          function updateInputsFromBounds(boundsObject) {
+            const digits = 4;
+            if (boundsInputs.north) {
+              boundsInputs.north.value = boundsObject.north.toFixed(digits);
+            }
+            if (boundsInputs.south) {
+              boundsInputs.south.value = boundsObject.south.toFixed(digits);
+            }
+            if (boundsInputs.east) {
+              boundsInputs.east.value = boundsObject.east.toFixed(digits);
+            }
+            if (boundsInputs.west) {
+              boundsInputs.west.value = boundsObject.west.toFixed(digits);
+            }
+          }
+
+          function updateHandles(boundsObject) {
+            handles.northWest.setLatLng([boundsObject.north, boundsObject.west]);
+            handles.northEast.setLatLng([boundsObject.north, boundsObject.east]);
+            handles.southWest.setLatLng([boundsObject.south, boundsObject.west]);
+            handles.southEast.setLatLng([boundsObject.south, boundsObject.east]);
+          }
+
+          function syncFromBounds(boundsObject, options = {}) {
+            currentBounds = boundsObject;
+            rectangle.setBounds(objectToLatLngBounds(currentBounds));
+            updateHandles(currentBounds);
+            if (options.updateInputs !== false) {
+              updateInputsFromBounds(currentBounds);
+            }
+            if (options.fitMap) {
+              map.fitBounds(objectToLatLngBounds(currentBounds).pad(0.05));
+            }
+          }
+
+          const minLatSpan = 0.0001;
+          const minLngSpan = 0.0001;
+
+          function clamp(value, min, max) {
+            return Math.min(Math.max(value, min), max);
+          }
+
+          function handleDrag(corner) {
+            return function () {
+              const latLng = handles[corner].getLatLng();
+              const updated = { ...currentBounds };
+              if (corner === "northWest" || corner === "northEast") {
+                updated.north = clamp(
+                  latLng.lat,
+                  updated.south + minLatSpan,
+                  90
+                );
+              }
+              if (corner === "southWest" || corner === "southEast") {
+                updated.south = clamp(
+                  latLng.lat,
+                  -90,
+                  updated.north - minLatSpan
+                );
+              }
+              if (corner === "northWest" || corner === "southWest") {
+                updated.west = clamp(
+                  latLng.lng,
+                  -180,
+                  updated.east - minLngSpan
+                );
+              }
+              if (corner === "northEast" || corner === "southEast") {
+                updated.east = clamp(
+                  latLng.lng,
+                  updated.west + minLngSpan,
+                  180
+                );
+              }
+              syncFromBounds(updated, { fitMap: false });
+            };
+          }
+
+          function handleDragEnd() {
+            map.fitBounds(objectToLatLngBounds(currentBounds).pad(0.05));
+          }
+
+          handles.northWest.on("drag", handleDrag("northWest"));
+          handles.northWest.on("dragend", handleDragEnd);
+          handles.northEast.on("drag", handleDrag("northEast"));
+          handles.northEast.on("dragend", handleDragEnd);
+          handles.southWest.on("drag", handleDrag("southWest"));
+          handles.southWest.on("dragend", handleDragEnd);
+          handles.southEast.on("drag", handleDrag("southEast"));
+          handles.southEast.on("dragend", handleDragEnd);
+
+          refreshBoundsFromInputs = function () {
+            const bounds = getBoundsFromInputs();
+            if (!bounds) {
+              return;
+            }
+            syncFromBounds(boundsToObject(bounds), { fitMap: true });
+          };
+
+          Object.values(boundsInputs).forEach((input) => {
+            if (!input) return;
+            input.addEventListener("change", refreshBoundsFromInputs);
+            input.addEventListener("blur", refreshBoundsFromInputs);
+          });
+
+          syncFromBounds(currentBounds, { fitMap: true });
         }
       })();
     </script>
