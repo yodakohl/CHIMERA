@@ -22,6 +22,7 @@ from .services.imagery import (
     GIBS_DEFAULT_LAYER,
     MAX_DIM,
     MIN_DIM,
+    MAPTILER_LATITUDE_LIMIT,
     ImageryProviderKey,
     PROVIDER_METADATA,
     download_area_tiles,
@@ -83,6 +84,36 @@ class ScanController:
 
 _active_scans: Dict[str, ScanController] = {}
 _scan_lock = asyncio.Lock()
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(min(value, maximum), minimum)
+
+
+def _tile_bounds_payload(tile: AreaTile, fallback_dim: float) -> tuple[Dict[str, float], float]:
+    try:
+        span = float(tile.degree_size)
+    except (TypeError, ValueError):
+        span = 0.0
+    if span <= 0:
+        try:
+            span = float(fallback_dim)
+        except (TypeError, ValueError):
+            span = 0.0
+    if span <= 0:
+        span = DEFAULT_SCAN_TILE_SIZE
+
+    max_latitude = 90.0
+    if tile.provider == ImageryProviderKey.MAPTILER_SATELLITE.value:
+        max_latitude = MAPTILER_LATITUDE_LIMIT
+
+    half = span / 2.0
+    north = _clamp(tile.lat + half, -max_latitude, max_latitude)
+    south = _clamp(tile.lat - half, -max_latitude, max_latitude)
+    east = _clamp(tile.lon + half, -180.0, 180.0)
+    west = _clamp(tile.lon - half, -180.0, 180.0)
+    bounds = {"north": north, "south": south, "east": east, "west": west}
+    return bounds, span
 
 
 async def _register_scan(scan_id: str) -> ScanController:
@@ -308,12 +339,15 @@ async def stream_scan_area(
                 f"Analysis failed for tile at {tile.lat:.4f}, {tile.lon:.4f}"
             )
             analysis_failures.append(failure_message)
+            bounds, span = _tile_bounds_payload(tile, tile_size)
             await enqueue(
                 "analysis-failed",
                 {
                     "message": failure_message,
                     "lat": tile.lat,
                     "lon": tile.lon,
+                    "bounds": bounds,
+                    "degree_size": span,
                 },
             )
             tile.path.unlink(missing_ok=True)
@@ -332,6 +366,7 @@ async def stream_scan_area(
 
         processed_count += 1
         image_relative = str(tile.path.relative_to(UPLOAD_DIR))
+        bounds, span = _tile_bounds_payload(tile, tile_size)
         await enqueue(
             "tile",
             {
@@ -344,6 +379,10 @@ async def stream_scan_area(
                 "image": f"/data/uploads/{image_relative}",
                 "timestamp": record.created_at.isoformat(),
                 "provider_label": provider_label,
+                "bounds": bounds,
+                "degree_size": span,
+                "low_detail": tile.low_detail,
+                "detail_ratio": tile.detail_ratio,
             },
         )
 
