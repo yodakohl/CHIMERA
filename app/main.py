@@ -13,7 +13,7 @@ from fastapi.templating import Jinja2Templates
 from sqlmodel import Session, select
 
 from .database import DATA_DIR, get_session, init_db
-from .models import AnalysisResult
+from .models import AnalysisResult, ApiUsageStat
 from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
 from .services.imagery import (
     GIBS_DEFAULT_LAYER,
@@ -304,6 +304,29 @@ def _build_results(session: Session) -> List[Dict[str, object]]:
     ]
 
 
+def _provider_label_for(provider_key: str) -> str:
+    for key, metadata in PROVIDER_METADATA.items():
+        if key.value == provider_key:
+            return metadata.get("label", provider_key)
+    return provider_key
+
+
+def _build_api_usage(session: Session) -> List[Dict[str, object]]:
+    statement = select(ApiUsageStat).order_by(ApiUsageStat.provider)
+    stats: List[ApiUsageStat] = session.exec(statement).all()
+    usage: List[Dict[str, object]] = []
+    for stat in stats:
+        usage.append(
+            {
+                "provider": stat.provider,
+                "provider_label": _provider_label_for(stat.provider),
+                "request_count": stat.request_count,
+                "last_used_at": stat.last_used_at,
+            }
+        )
+    return usage
+
+
 def _render_home(
     request: Request,
     session: Session,
@@ -321,6 +344,9 @@ def _render_home(
         "providers": PROVIDER_OPTIONS,
         "default_provider": DEFAULT_IMAGERY_PROVIDER.value,
         "selected_provider": selected_provider or DEFAULT_IMAGERY_PROVIDER.value,
+        "min_tile_size": MIN_DIM,
+        "max_tile_size": MAX_DIM,
+        "api_usage": _build_api_usage(session),
     }
     if message:
         context["message"] = message

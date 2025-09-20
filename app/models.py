@@ -25,3 +25,9 @@ class AnalysisResult(SQLModel, table=True):
     def detection_labels(self) -> str:
         detected = [item.get("object") for item in self.detections() if item.get("object")]
         return ", ".join(detected)
+
+
+class ApiUsageStat(SQLModel, table=True):
+    provider: str = Field(primary_key=True)
+    request_count: int = Field(default=0)
+    last_used_at: datetime | None = Field(default=None, nullable=True)
