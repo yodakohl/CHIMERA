@@ -50,6 +50,8 @@ DEFAULT_SCAN_TILE_SIZE = 0.01
 DEFAULT_SCAN_DATE: str | None = None
 DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.MAPTILER_SATELLITE
 
+RECLASSIFY_STREAM_BATCH_SIZE = 32
+
 
 PROVIDER_OPTIONS = [
     {
@@ -549,74 +551,139 @@ async def stop_scan(request: StopScanRequest) -> Dict[str, object]:
 
 
 @app.post("/scan-area/reclassify")
-def reclassify_tiles(request: ReclassifyRequest, session: Session = Depends(get_session)) -> Dict[str, object]:
-    if not request.tiles:
-        return {"processed": 0, "results": [], "errors": []}
-
+async def reclassify_tiles(
+    request: ReclassifyRequest, session: Session = Depends(get_session)
+) -> StreamingResponse:
     analyzer = get_analyzer()
     prompt = (request.prompt or "").strip() or DEFAULT_PROMPT
 
-    records: List[AnalysisResult] = []
-    results: List[Dict[str, object]] = []
-    errors: List[Dict[str, object]] = []
+    async def stream() -> AsyncIterator[bytes]:
+        total_processed = 0
+        total_errors = 0
+        results_batch: List[Dict[str, object]] = []
+        errors_batch: List[Dict[str, object]] = []
+        has_pending_records = False
 
-    for tile in request.tiles:
-        if not tile.image:
-            errors.append({"message": "Missing image reference."})
-            continue
+        def flush_batch(force: bool = False) -> bytes | None:
+            nonlocal results_batch, errors_batch, has_pending_records, total_processed
+            if not force and len(results_batch) + len(errors_batch) < RECLASSIFY_STREAM_BATCH_SIZE:
+                return None
+            if not results_batch and not errors_batch:
+                return None
+            if has_pending_records:
+                session.commit()
+                has_pending_records = False
+            payload = {
+                "type": "batch",
+                "results": results_batch,
+                "errors": errors_batch,
+                "processed": total_processed,
+                "prompt": prompt,
+            }
+            results_batch = []
+            errors_batch = []
+            return json.dumps(payload).encode("utf-8") + b"\n"
 
-        try:
-            image_path, relative_path = _resolve_cached_image(tile.image)
-        except FileNotFoundError as exc:
-            errors.append({"image": tile.image, "message": str(exc)})
-            continue
-        except ValueError as exc:
-            errors.append({"image": tile.image, "message": str(exc)})
-            continue
+        if not request.tiles:
+            final_payload = {
+                "type": "complete",
+                "processed": 0,
+                "error_count": 0,
+                "prompt": prompt,
+            }
+            yield json.dumps(final_payload).encode("utf-8") + b"\n"
+            return
 
-        try:
-            analysis = analyzer.analyze(image_path, prompt)
-        except Exception as exc:  # pragma: no cover - model failure
-            logger.exception("Reclassification failed for cached tile %s: %s", image_path, exc)
-            errors.append(
+        for tile in request.tiles:
+            if not tile.image:
+                errors_batch.append({"message": "Missing image reference."})
+                total_errors += 1
+                chunk = flush_batch()
+                if chunk:
+                    yield chunk
+                continue
+
+            try:
+                image_path, relative_path = _resolve_cached_image(tile.image)
+            except FileNotFoundError as exc:
+                errors_batch.append({"image": tile.image, "message": str(exc)})
+                total_errors += 1
+                chunk = flush_batch()
+                if chunk:
+                    yield chunk
+                continue
+            except ValueError as exc:
+                errors_batch.append({"image": tile.image, "message": str(exc)})
+                total_errors += 1
+                chunk = flush_batch()
+                if chunk:
+                    yield chunk
+                continue
+
+            try:
+                analysis = analyzer.analyze(image_path, prompt)
+            except Exception as exc:  # pragma: no cover - model failure
+                logger.exception("Reclassification failed for cached tile %s: %s", image_path, exc)
+                errors_batch.append(
+                    {
+                        "image": tile.image,
+                        "message": "Analysis failed for cached tile.",
+                    }
+                )
+                total_errors += 1
+                chunk = flush_batch()
+                if chunk:
+                    yield chunk
+                continue
+
+            created_at = datetime.utcnow()
+            record = AnalysisResult(
+                image_filename=relative_path,
+                prompt=analysis["prompt"],
+                caption=analysis["caption"],
+                unusual_summary=analysis["unusual_summary"],
+                detection_payload=serialize_detections(analysis["detections"]),
+                created_at=created_at,
+            )
+            session.add(record)
+            has_pending_records = True
+
+            results_batch.append(
                 {
-                    "image": tile.image,
-                    "message": "Analysis failed for cached tile.",
+                    "image": f"/data/uploads/{relative_path}",
+                    "caption": analysis["caption"],
+                    "unusual_summary": analysis["unusual_summary"],
+                    "detections": analysis["detections"],
+                    "timestamp": created_at.isoformat(),
+                    "lat": tile.lat,
+                    "lon": tile.lon,
+                    "bounds": tile.bounds,
+                    "degree_size": tile.degree_size,
+                    "provider_label": tile.provider_label,
                 }
             )
-            continue
+            total_processed += 1
 
-        created_at = datetime.utcnow()
-        record = AnalysisResult(
-            image_filename=relative_path,
-            prompt=analysis["prompt"],
-            caption=analysis["caption"],
-            unusual_summary=analysis["unusual_summary"],
-            detection_payload=serialize_detections(analysis["detections"]),
-            created_at=created_at,
-        )
-        records.append(record)
+            chunk = flush_batch()
+            if chunk:
+                yield chunk
 
-        results.append(
-            {
-                "image": f"/data/uploads/{relative_path}",
-                "caption": analysis["caption"],
-                "unusual_summary": analysis["unusual_summary"],
-                "detections": analysis["detections"],
-                "timestamp": created_at.isoformat(),
-                "lat": tile.lat,
-                "lon": tile.lon,
-                "bounds": tile.bounds,
-                "degree_size": tile.degree_size,
-                "provider_label": tile.provider_label,
-            }
-        )
+        chunk = flush_batch(force=True)
+        if chunk:
+            yield chunk
 
-    for record in records:
-        session.add(record)
-    session.commit()
+        if has_pending_records:
+            session.commit()
 
-    return {"processed": len(results), "results": results, "errors": errors, "prompt": prompt}
+        final_payload = {
+            "type": "complete",
+            "processed": total_processed,
+            "error_count": total_errors,
+            "prompt": prompt,
+        }
+        yield json.dumps(final_payload).encode("utf-8") + b"\n"
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
 @app.post("/analysis/clear")
