@@ -9,11 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Dict, List
 
-from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlmodel import Session, select
+from sqlmodel import Session, delete, select
 
 from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult, ApiUsageStat
@@ -71,6 +71,20 @@ class StopScanRequest(BaseModel):
     scan_id: str
 
 
+class ReclassifyTilePayload(BaseModel):
+    image: str
+    lat: float | None = None
+    lon: float | None = None
+    bounds: Dict[str, float] | None = None
+    degree_size: float | None = None
+    provider_label: str | None = None
+
+
+class ReclassifyRequest(BaseModel):
+    tiles: List[ReclassifyTilePayload]
+    prompt: str = DEFAULT_PROMPT
+
+
 class ScanController:
     def __init__(self) -> None:
         self.cancel_event = asyncio.Event()
@@ -115,6 +129,32 @@ def _tile_bounds_payload(tile: AreaTile, fallback_dim: float) -> tuple[Dict[str,
     west = _clamp(tile.lon - half, -180.0, 180.0)
     bounds = {"north": north, "south": south, "east": east, "west": west}
     return bounds, span
+
+
+def _resolve_cached_image(image_reference: str) -> tuple[Path, str]:
+    reference = (image_reference or "").strip()
+    if not reference:
+        raise ValueError("Image path is required")
+
+    prefix = "/data/uploads/"
+    if reference.startswith(prefix):
+        reference = reference[len(prefix) :]
+
+    relative_path = Path(reference.lstrip("/"))
+    if relative_path.is_absolute() or any(part == ".." for part in relative_path.parts):
+        raise ValueError("Invalid image path")
+
+    uploads_root = UPLOAD_DIR.resolve()
+    candidate = (uploads_root / relative_path).resolve()
+    try:
+        candidate.relative_to(uploads_root)
+    except ValueError as exc:
+        raise ValueError("Image path must be within the uploads directory") from exc
+
+    if not candidate.exists():
+        raise FileNotFoundError(f"Cached image not found: {relative_path}")
+
+    return candidate, str(relative_path).replace("\\", "/")
 
 
 async def _register_scan(scan_id: str) -> ScanController:
@@ -506,6 +546,85 @@ async def stop_scan(request: StopScanRequest) -> Dict[str, object]:
 
     controller.cancel()
     return {"status": "stopping"}
+
+
+@app.post("/scan-area/reclassify")
+def reclassify_tiles(request: ReclassifyRequest, session: Session = Depends(get_session)) -> Dict[str, object]:
+    if not request.tiles:
+        return {"processed": 0, "results": [], "errors": []}
+
+    analyzer = get_analyzer()
+    prompt = (request.prompt or "").strip() or DEFAULT_PROMPT
+
+    records: List[AnalysisResult] = []
+    results: List[Dict[str, object]] = []
+    errors: List[Dict[str, object]] = []
+
+    for tile in request.tiles:
+        if not tile.image:
+            errors.append({"message": "Missing image reference."})
+            continue
+
+        try:
+            image_path, relative_path = _resolve_cached_image(tile.image)
+        except FileNotFoundError as exc:
+            errors.append({"image": tile.image, "message": str(exc)})
+            continue
+        except ValueError as exc:
+            errors.append({"image": tile.image, "message": str(exc)})
+            continue
+
+        try:
+            analysis = analyzer.analyze(image_path, prompt)
+        except Exception as exc:  # pragma: no cover - model failure
+            logger.exception("Reclassification failed for cached tile %s: %s", image_path, exc)
+            errors.append(
+                {
+                    "image": tile.image,
+                    "message": "Analysis failed for cached tile.",
+                }
+            )
+            continue
+
+        created_at = datetime.utcnow()
+        record = AnalysisResult(
+            image_filename=relative_path,
+            prompt=analysis["prompt"],
+            caption=analysis["caption"],
+            unusual_summary=analysis["unusual_summary"],
+            detection_payload=serialize_detections(analysis["detections"]),
+            created_at=created_at,
+        )
+        records.append(record)
+
+        results.append(
+            {
+                "image": f"/data/uploads/{relative_path}",
+                "caption": analysis["caption"],
+                "unusual_summary": analysis["unusual_summary"],
+                "detections": analysis["detections"],
+                "timestamp": created_at.isoformat(),
+                "lat": tile.lat,
+                "lon": tile.lon,
+                "bounds": tile.bounds,
+                "degree_size": tile.degree_size,
+                "provider_label": tile.provider_label,
+            }
+        )
+
+    for record in records:
+        session.add(record)
+    session.commit()
+
+    return {"processed": len(results), "results": results, "errors": errors, "prompt": prompt}
+
+
+@app.post("/analysis/clear")
+def clear_analysis_history(session: Session = Depends(get_session)) -> Dict[str, object]:
+    result = session.exec(delete(AnalysisResult))
+    session.commit()
+    cleared = result.rowcount if result and result.rowcount is not None else 0
+    return {"status": "ok", "cleared": cleared}
 
 
 def _build_scan_summary_details(

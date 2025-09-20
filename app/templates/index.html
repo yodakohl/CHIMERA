@@ -178,13 +178,28 @@
           </button>
         </div>
       </form>
-      <div class="scan-progress" id="scan-progress">
-        <h3>Live scan progress</h3>
-        <p class="hint">Updates appear as each tile is downloaded and analyzed.</p>
-        <ul id="scan-events" class="scan-events"></ul>
-      </div>
+      <details class="scan-progress" id="scan-progress">
+        <summary>
+          <div class="summary-content">
+            <span class="summary-title">Live scan progress</span>
+            <span class="summary-description"
+              >Updates appear as each tile is downloaded and analyzed.</span
+            >
+          </div>
+        </summary>
+        <div class="scan-progress-body">
+          <ul id="scan-events" class="scan-events"></ul>
+        </div>
+      </details>
       <div class="scan-gallery" id="scan-gallery">
-        <h3>Scanned tile thumbnails</h3>
+        <div class="scan-gallery-header">
+          <h3>Scanned tile thumbnails</h3>
+          <div class="scan-gallery-actions">
+            <button type="button" id="reclassify-tiles" class="button button-secondary" disabled>
+              Reclassify cached tiles
+            </button>
+          </div>
+        </div>
         <p class="hint">
           Preview the most recent imagery tiles analyzed during the current scan.
         </p>
@@ -225,86 +240,112 @@
     </section>
 
     <section class="results">
-      <h2>Analysis history</h2>
-      {% if results %}
-      <table>
-        <thead>
-          <tr>
-            <th>Timestamp</th>
-            <th>Image</th>
-            <th>Caption</th>
-            <th>Unusual findings</th>
-            <th>Detected objects</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for result in results %}
-          <tr>
-            <td>{{ result.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-            <td class="image-cell">
-              {% if result.image_filename %}
-              {% set image_url = '/data/uploads/' ~ result.image_filename %}
-              {% set image_label = result.image_filename.rsplit('/', 1)[-1] %}
-              <a href="{{ image_url }}" target="_blank" class="image-link">
-                <img
-                  src="{{ image_url }}"
-                  alt="{{ image_label }}"
-                  class="tile-thumbnail"
-                  loading="lazy"
-                />
-                <span>{{ image_label }}</span>
-              </a>
-              {% else %}
-              <em>No image available</em>
-              {% endif %}
-            </td>
-            <td>{{ result.caption }}</td>
-            <td>{{ result.unusual_summary }}</td>
-            <td>
-              {% if result.detections %}
-              <ul>
-                {% for detection in result.detections %}
-                <li>
-                  <strong>{{ detection["object"] }}</strong>
-                  (confidence {{ '%.2f'|format(detection["confidence"]) }})
-                  {% set answers = detection.get('answers') %}
-                  {% if answers %}
-                  <div class="meta">Model answers: {{ answers|join(', ') }}</div>
-                  {% endif %}
-                  {% set box = detection.get('box') %}
-                  {% if box %}
-                  <div class="meta">
-                    Bounding box: xmin {{ box["xmin"] }}, ymin {{ box["ymin"] }}, xmax
-                    {{ box["xmax"] }}, ymax {{ box["ymax"] }}
-                  </div>
-                  {% endif %}
-                </li>
-                {% endfor %}
-              </ul>
-              {% else %}
-              <em>No objects detected above the confidence threshold</em>
-              {% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-      <p>No analyses have been recorded yet. Upload your first satellite scene to begin.</p>
-      {% endif %}
+      <div class="results-header">
+        <h2>Analysis history</h2>
+        <div class="results-actions">
+          <button
+            type="button"
+            id="clear-history"
+            class="button button-danger"
+            {% if not results %}disabled{% endif %}
+          >
+            Clear history
+          </button>
+        </div>
+      </div>
+      <p
+        class="hint"
+        id="history-empty-message"
+        {% if results %}hidden{% endif %}
+      >
+        No analyses have been recorded yet. Upload your first satellite scene to begin.
+      </p>
+      <div
+        id="history-table-wrapper"
+        class="history-table-wrapper"
+        {% if not results %}hidden{% endif %}
+      >
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Image</th>
+              <th>Caption</th>
+              <th>Unusual findings</th>
+              <th>Detected objects</th>
+            </tr>
+          </thead>
+          <tbody id="analysis-history-body">
+            {% for result in results %}
+            <tr>
+              <td>{{ result.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+              <td class="image-cell">
+                {% if result.image_filename %}
+                {% set image_url = '/data/uploads/' ~ result.image_filename %}
+                {% set image_label = result.image_filename.rsplit('/', 1)[-1] %}
+                <a href="{{ image_url }}" target="_blank" class="image-link">
+                  <img
+                    src="{{ image_url }}"
+                    alt="{{ image_label }}"
+                    class="tile-thumbnail"
+                    loading="lazy"
+                  />
+                  <span>{{ image_label }}</span>
+                </a>
+                {% else %}
+                <em>No image available</em>
+                {% endif %}
+              </td>
+              <td>{{ result.caption }}</td>
+              <td>{{ result.unusual_summary }}</td>
+              <td>
+                {% if result.detections %}
+                <ul>
+                  {% for detection in result.detections %}
+                  <li>
+                    <strong>{{ detection["object"] }}</strong>
+                    (confidence {{ '%.2f'|format(detection["confidence"]) }})
+                    {% set answers = detection.get('answers') %}
+                    {% if answers %}
+                    <div class="meta">Model answers: {{ answers|join(', ') }}</div>
+                    {% endif %}
+                    {% set box = detection.get('box') %}
+                    {% if box %}
+                    <div class="meta">
+                      Bounding box: xmin {{ box["xmin"] }}, ymin {{ box["ymin"] }}, xmax
+                      {{ box["xmax"] }}, ymax {{ box["ymax"] }}
+                    </div>
+                    {% endif %}
+                  </li>
+                  {% endfor %}
+                </ul>
+                {% else %}
+                <em>No objects detected above the confidence threshold</em>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
     </section>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
       (function () {
+        const defaultPrompt = {{ default_prompt|tojson }};
         const form = document.getElementById("area-scan-form");
         const startButton = document.getElementById("start-scan");
         const stopButton = document.getElementById("stop-scan");
         const globalButton = document.getElementById("global-scan");
         const eventsList = document.getElementById("scan-events");
         const progressSection = document.getElementById("scan-progress");
-        const historyTable = document.querySelector(".results table tbody");
         const gallerySection = document.getElementById("scan-gallery");
         const thumbnailGrid = document.getElementById("scan-thumbnails");
+        const reclassifyButton = document.getElementById("reclassify-tiles");
+        const clearHistoryButton = document.getElementById("clear-history");
+        const historyTable = document.getElementById("analysis-history-body");
+        const historyContainer = document.getElementById("history-table-wrapper");
+        const historyEmptyMessage = document.getElementById("history-empty-message");
         const boundsInputs = {
           north: document.getElementById("north"),
           south: document.getElementById("south"),
@@ -317,6 +358,44 @@
         let activeScanId = null;
         let tileCounter = 0;
         let scanFootprintsLayer = null;
+        let reclassifying = false;
+        let scanRunning = false;
+
+        const tileCache = new Map();
+
+        function updateHistoryVisibility() {
+          if (!historyTable) return;
+          const hasRows = historyTable.childElementCount > 0;
+          if (historyContainer) {
+            historyContainer.hidden = !hasRows;
+          }
+          if (historyEmptyMessage) {
+            historyEmptyMessage.hidden = hasRows;
+          }
+          if (clearHistoryButton) {
+            clearHistoryButton.disabled = !hasRows;
+          }
+        }
+
+        function updateReclassifyState() {
+          if (!reclassifyButton) return;
+          const hasTiles = tileCache.size > 0;
+          reclassifyButton.disabled = !hasTiles || reclassifying || scanRunning;
+        }
+
+        function cacheTile(tile) {
+          if (!tile || !tile.image) {
+            return null;
+          }
+          const existing = tileCache.get(tile.image) || {};
+          const merged = { ...existing, ...tile };
+          tileCache.set(tile.image, merged);
+          updateReclassifyState();
+          return merged;
+        }
+
+        updateHistoryVisibility();
+        updateReclassifyState();
 
         function getBoundsFromInputs() {
           if (!window.L || typeof window.L.latLngBounds !== "function") {
@@ -358,6 +437,7 @@
           }
           if (progressSection) {
             progressSection.classList.remove("visible");
+            progressSection.open = false;
           }
           if (thumbnailGrid) {
             thumbnailGrid.innerHTML = "";
@@ -365,6 +445,8 @@
           if (gallerySection) {
             gallerySection.classList.remove("visible");
           }
+          tileCache.clear();
+          updateReclassifyState();
           clearScanFootprints();
         }
 
@@ -385,7 +467,11 @@
           item.appendChild(text);
           eventsList.prepend(item);
           if (progressSection) {
+            const wasHidden = !progressSection.classList.contains("visible");
             progressSection.classList.add("visible");
+            if (wasHidden) {
+              progressSection.open = true;
+            }
           }
         }
 
@@ -477,11 +563,13 @@
         }
 
         function setRunning(running) {
+          scanRunning = running;
           if (startButton) startButton.disabled = running;
           if (stopButton) stopButton.disabled = !running;
           if (!running) {
             activeScanId = null;
           }
+          updateReclassifyState();
         }
 
         function closeSource() {
@@ -548,6 +636,22 @@
                 );
                 entry.appendChild(confidenceText);
               }
+              const answers = Array.isArray(item.answers)
+                ? item.answers.filter(Boolean)
+                : null;
+              if (answers && answers.length) {
+                const answersMeta = document.createElement("div");
+                answersMeta.className = "meta";
+                answersMeta.textContent = `Model answers: ${answers.join(", ")}`;
+                entry.appendChild(answersMeta);
+              }
+              const box = item.box;
+              if (box && typeof box === "object") {
+                const boxMeta = document.createElement("div");
+                boxMeta.className = "meta";
+                boxMeta.textContent = `Bounding box: xmin ${box.xmin}, ymin ${box.ymin}, xmax ${box.xmax}, ymax ${box.ymax}`;
+                entry.appendChild(boxMeta);
+              }
               list.appendChild(entry);
             });
             detectionsCell.appendChild(list);
@@ -559,6 +663,7 @@
           row.appendChild(detectionsCell);
 
           historyTable.prepend(row);
+          updateHistoryVisibility();
         }
 
         if (globalButton) {
@@ -620,6 +725,7 @@
               tileCounter = index;
               const caption = payload.caption || "Tile analyzed.";
               appendEvent(`Tile #${index}: ${caption}`, "success");
+              cacheTile(payload);
               updateHistoryTable(payload);
               addThumbnail(payload);
               const tileStatus = payload.low_detail ? "warning" : "success";
@@ -685,6 +791,135 @@
             appendEvent("Stop requested.", "info");
             setRunning(false);
             closeSource();
+          });
+        }
+
+        if (reclassifyButton) {
+          reclassifyButton.addEventListener("click", function () {
+            if (reclassifyButton.disabled || tileCache.size === 0 || reclassifying) {
+              return;
+            }
+
+            const promptInput = document.getElementById("area-prompt");
+            const promptValue = promptInput ? promptInput.value : "";
+            const prompt = (promptValue || "").trim() || defaultPrompt;
+
+            const tiles = Array.from(tileCache.values()).map((tile) => ({
+              image: tile.image,
+              lat: tile.lat ?? null,
+              lon: tile.lon ?? null,
+              bounds: tile.bounds || null,
+              degree_size: tile.degree_size ?? null,
+              provider_label: tile.provider_label ?? null,
+            }));
+
+            if (!tiles.length) {
+              return;
+            }
+
+            reclassifying = true;
+            updateReclassifyState();
+            appendEvent(
+              `Reclassifying ${tiles.length} cached tile${tiles.length === 1 ? "" : "s"}...`,
+              "info"
+            );
+
+            fetch("/scan-area/reclassify", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ prompt, tiles }),
+            })
+              .then((response) => {
+                if (!response.ok) {
+                  throw new Error("Request failed");
+                }
+                return response.json();
+              })
+              .then((data) => {
+                const results = Array.isArray(data.results) ? data.results : [];
+                const errors = Array.isArray(data.errors) ? data.errors : [];
+                let processed = typeof data.processed === "number" ? data.processed : results.length;
+
+                results.forEach((result) => {
+                  cacheTile(result);
+                  updateHistoryTable(result);
+                  const message = result.caption
+                    ? `Reclassified tile: ${result.caption}`
+                    : "Reclassified cached tile.";
+                  appendEvent(message, "success");
+                });
+
+                errors.forEach((error) => {
+                  const message =
+                    error && error.message
+                      ? error.message
+                      : "Failed to reclassify a cached tile.";
+                  appendEvent(message, "warning");
+                });
+
+                if (processed && results.length === 0 && errors.length === 0) {
+                  appendEvent(
+                    `Reclassified ${processed} cached tile${processed === 1 ? "" : "s"}.`,
+                    "success"
+                  );
+                } else if (processed) {
+                  appendEvent(
+                    `Reclassification completed for ${processed} cached tile${processed === 1 ? "" : "s"}.`,
+                    "info"
+                  );
+                } else if (!errors.length) {
+                  appendEvent("No cached tiles were reclassified.", "warning");
+                }
+              })
+              .catch(() => {
+                appendEvent("Reclassifying cached tiles failed.", "error");
+              })
+              .finally(() => {
+                reclassifying = false;
+                updateReclassifyState();
+              });
+          });
+        }
+
+        if (clearHistoryButton) {
+          clearHistoryButton.addEventListener("click", function () {
+            if (clearHistoryButton.disabled) {
+              return;
+            }
+            const confirmed = window.confirm(
+              "This will remove all saved analysis results. Continue?"
+            );
+            if (!confirmed) {
+              updateHistoryVisibility();
+              return;
+            }
+
+            clearHistoryButton.disabled = true;
+
+            fetch("/analysis/clear", { method: "POST" })
+              .then((response) => {
+                if (!response.ok) {
+                  throw new Error("Request failed");
+                }
+                return response.json();
+              })
+              .then((data) => {
+                if (historyTable) {
+                  historyTable.innerHTML = "";
+                }
+                updateHistoryVisibility();
+                const cleared = data && typeof data.cleared === "number" ? data.cleared : 0;
+                const summary = cleared
+                  ? `Cleared ${cleared} analysis entr${cleared === 1 ? "y" : "ies"}.`
+                  : "Analysis history cleared.";
+                appendEvent(summary, "info");
+              })
+              .catch(() => {
+                appendEvent("Failed to clear analysis history.", "error");
+              })
+              .finally(() => {
+                updateHistoryVisibility();
+              });
           });
         }
 
@@ -875,5 +1110,6 @@
         }
       })();
     </script>
+
   </body>
 </html>
