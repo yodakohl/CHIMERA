@@ -290,7 +290,7 @@ async def download_maptiler_area_tiles(
                     )
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
-                    detail = _short_error_detail(exc.response.text)
+                    detail = _maptiler_http_error_detail(exc.response)
                     failures.append(
                         f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
                     )
@@ -307,7 +307,7 @@ async def download_maptiler_area_tiles(
 
                 if not _is_image_response(response):
                     content_type = response.headers.get("Content-Type", "unknown")
-                    detail = _short_error_detail(response.text)
+                    detail = _maptiler_http_error_detail(response)
                     failures.append(
                         f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
                     )
@@ -1239,6 +1239,38 @@ def _naip_tile_intersects_coverage(
     lat_min, lat_max = NAIP_COVERAGE_LAT_RANGE
     lon_min, lon_max = NAIP_COVERAGE_LON_RANGE
     return not (north < lat_min or south > lat_max or east < lon_min or west > lon_max)
+
+
+def _maptiler_http_error_detail(response: httpx.Response) -> str:
+    """Summarize error responses from the MapTiler Static Maps API."""
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    content_bytes = getattr(response, "content", b"")
+    content_length = len(content_bytes) if content_bytes else 0
+
+    if "image" in content_type:
+        if response.status_code in {401, 403}:
+            return (
+                "forbidden (MapTiler returned an error image). Verify that the MAPTILER_API_KEY "
+                "environment variable is set correctly, the key includes Static Maps API access, "
+                "and the attribution/logo overlay remains enabled for free plans."
+            )
+        return f"{content_type} payload ({content_length} bytes)"
+
+    if "application/json" in content_type or "text/json" in content_type:
+        try:
+            payload = response.json()
+        except Exception:  # pragma: no cover - fallback for unexpected payloads
+            return _short_error_detail(response.text)
+        else:
+            if isinstance(payload, dict):
+                for key in ("message", "error", "detail", "description", "error_description"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return _short_error_detail(value)
+            return _short_error_detail(str(payload))
+
+    return _short_error_detail(response.text)
 
 
 def _short_error_detail(detail: str) -> str:
