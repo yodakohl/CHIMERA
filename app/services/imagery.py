@@ -232,12 +232,28 @@ async def download_maptiler_area_tiles(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    lat_limit = MAPTILER_LATITUDE_LIMIT
+    limit_epsilon = 1e-6
+    if north > lat_limit + limit_epsilon or south < -lat_limit - limit_epsilon:
+        raise ValueError(
+            "MapTiler satellite imagery covers latitudes between "
+            f"{-lat_limit:.4f}° and {lat_limit:.4f}°. "
+            "Please adjust the bounding box or switch to the NASA GIBS provider for polar regions."
+        )
+
+    clamped_south = _clamp(south, -lat_limit, lat_limit)
+    clamped_north = _clamp(north, -lat_limit, lat_limit)
+    clamp_min = _clamp(-lat_limit + dim / 2, -lat_limit, lat_limit)
+    clamp_max = _clamp(lat_limit - dim / 2, -lat_limit, lat_limit)
+    if clamp_min >= clamp_max:
+        clamp_min, clamp_max = -lat_limit, lat_limit
+
     lat_centers = _build_axis_centers(
-        minimum=south,
-        maximum=north,
+        minimum=clamped_south,
+        maximum=clamped_north,
         dim=dim,
-        clamp_min=-90.0 + dim / 2,
-        clamp_max=90.0 - dim / 2,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
     )
     lon_centers = _build_axis_centers(
         minimum=west,
@@ -263,7 +279,10 @@ async def download_maptiler_area_tiles(
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         for lat in lat_centers:
             for lon in lon_centers:
+                lat = _clamp(lat, clamp_min, clamp_max)
                 south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+                south_bound = _clamp(south_bound, -lat_limit, lat_limit)
+                north_bound = _clamp(north_bound, -lat_limit, lat_limit)
                 degree_span = max(dim, north_bound - south_bound, east_bound - west_bound, MIN_DIM)
                 tile_pixels = _maptiler_tile_pixels(degree_span)
                 zoom = _maptiler_zoom_level(
