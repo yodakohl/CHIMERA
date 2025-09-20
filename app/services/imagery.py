@@ -44,6 +44,13 @@ NAIP_IMAGE_FORMAT = "image/jpeg"
 NAIP_PIXELS_PER_DEGREE = 36000
 NAIP_MIN_TILE_PIXELS = 512
 NAIP_MAX_TILE_PIXELS = 4096
+NAIP_COVERAGE_LAT_RANGE = (18.0, 50.0)
+NAIP_COVERAGE_LON_RANGE = (-128.0, -64.0)
+NAIP_COVERAGE_NOTE = (
+    "outside USGS NAIP coverage (continental United States; approximately "
+    f"{NAIP_COVERAGE_LAT_RANGE[0]:.1f}°–{NAIP_COVERAGE_LAT_RANGE[1]:.1f}° latitude and "
+    f"{NAIP_COVERAGE_LON_RANGE[0]:.1f}°–{NAIP_COVERAGE_LON_RANGE[1]:.1f}° longitude)."
+)
 
 RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
@@ -321,6 +328,24 @@ async def download_naip_area_tiles(
                 lon_span = max(east_bound - west_bound, MIN_DIM)
                 width = _naip_tile_pixels(lon_span)
                 height = _naip_tile_pixels(lat_span)
+
+                if not _naip_tile_intersects_coverage(
+                    south_bound, north_bound, west_bound, east_bound
+                ):
+                    failures.append(
+                        f"lat {lat:.4f}, lon {lon:.4f}: {NAIP_COVERAGE_NOTE}"
+                    )
+                    logger.info(
+                        "Skipping NAIP tile at lat %.4f lon %.4f because it falls outside the service coverage "
+                        "(lat %.1f°–%.1f°, lon %.1f°–%.1f°).",
+                        lat,
+                        lon,
+                        NAIP_COVERAGE_LAT_RANGE[0],
+                        NAIP_COVERAGE_LAT_RANGE[1],
+                        NAIP_COVERAGE_LON_RANGE[0],
+                        NAIP_COVERAGE_LON_RANGE[1],
+                    )
+                    continue
 
                 bbox_lon_lat = (
                     f"{west_bound:.6f},{south_bound:.6f},{east_bound:.6f},{north_bound:.6f}"
@@ -994,6 +1019,14 @@ def _naip_tile_pixels(span: float) -> int:
     if estimated % 2:
         estimated += 1
     return min(estimated, NAIP_MAX_TILE_PIXELS)
+
+
+def _naip_tile_intersects_coverage(
+    south: float, north: float, west: float, east: float
+) -> bool:
+    lat_min, lat_max = NAIP_COVERAGE_LAT_RANGE
+    lon_min, lon_max = NAIP_COVERAGE_LON_RANGE
+    return not (north < lat_min or south > lat_max or east < lon_min or west > lon_max)
 
 
 def _short_error_detail(detail: str) -> str:
