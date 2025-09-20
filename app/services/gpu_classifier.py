@@ -22,12 +22,15 @@ caller can manipulate them without holding onto GPU memory.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Sequence
 
 import numpy as np
 import torch
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "classify_images_gpu",
@@ -217,6 +220,8 @@ def classify_images_gpu(
                 dtype=torch.float32,
                 non_blocking=non_blocking,
             )
+            current_batch = batch_tensor.shape[0] if batch_tensor.ndim > 0 else 1
+            logger.info("Running inference on batch of size %d", current_batch)
             result = prepared_model(batch_tensor)
             if not isinstance(result, torch.Tensor):
                 raise TypeError("Model must return a torch.Tensor for batched classification")
