@@ -60,8 +60,8 @@ Key features:
    use the automatic area scan form to request imagery for a latitude/longitude bounding box. By
    default the app retrieves crisp MapTiler satellite imagery centered on Vienna, Austria, but you
    can switch to NASA's Global Imagery Browse Services (GIBS) or the USGS NAIP aerial mosaics when
-   you need alternate coverage. Each scan is limited to 50 imagery requests to prevent accidental
-   overload of the services, and every tile is requested at a minimum of 256×256 pixels so the
+   you need alternate coverage. The downloader reuses cached tiles immediately and only throttles
+   outbound web requests, and every tile is requested at a minimum of 256×256 pixels so the
    vision models have enough detail to work with even for small bounding boxes. When the NASA GIBS
    VIIRS true-color layer is too blocky for object recognition, the downloader automatically retries
    with the higher resolution Landsat WELD mosaic to deliver ~30 m/pixel imagery.

@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import date as dt_date, datetime, timedelta
 from enum import Enum
@@ -81,7 +82,7 @@ FALLBACK_LOOKBACK_DAYS = 3
 
 MIN_DIM = 0.01
 MAX_DIM = 360.0
-MAX_TILES_PER_RUN = 50
+MAX_TILES_PER_RUN: int | None = None
 REQUEST_TIMEOUT = httpx.Timeout(60.0)
 
 IMAGERY_REQUEST_DELAY_ENV = "IMAGERY_REQUEST_DELAY"
@@ -89,6 +90,7 @@ DEFAULT_REQUEST_DELAY = 5.0
 IMAGERY_CACHE_DIR_ENV = "IMAGERY_CACHE_DIR"
 
 _tile_cache: TileCache | None = None
+_last_remote_request_at: float | None = None
 
 
 class ImageryCancellationError(Exception):
@@ -211,16 +213,35 @@ async def _notify_failure(
 
 async def _respect_rate_limit(cancel_event: asyncio.Event | None = None) -> None:
     delay = _request_delay_seconds()
+    now = time.monotonic()
+
+    global _last_remote_request_at
+
     if delay <= 0:
+        _last_remote_request_at = now
         return
+
+    if _last_remote_request_at is None:
+        _last_remote_request_at = now
+        return
+
+    target_time = _last_remote_request_at + delay
+    remaining = target_time - now
+    if remaining <= 0:
+        _last_remote_request_at = now
+        return
+
     if cancel_event is None:
-        await asyncio.sleep(delay)
-        return
-    try:
-        await asyncio.wait_for(asyncio.shield(cancel_event.wait()), timeout=delay)
-    except asyncio.TimeoutError:
-        return
-    raise ImageryCancellationError("Imagery request cancelled")
+        await asyncio.sleep(remaining)
+    else:
+        try:
+            await asyncio.wait_for(asyncio.shield(cancel_event.wait()), timeout=remaining)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            raise ImageryCancellationError("Imagery request cancelled")
+
+    _last_remote_request_at = max(time.monotonic(), target_time)
 
 
 def _cache_key(provider: str, *parts: object) -> str:
@@ -435,7 +456,7 @@ async def download_maptiler_area_tiles(
     )
 
     total_tiles = len(lat_centers) * len(lon_centers)
-    if total_tiles > MAX_TILES_PER_RUN:
+    if MAX_TILES_PER_RUN is not None and total_tiles > MAX_TILES_PER_RUN:
         raise ValueError(
             "Requested area requires "
             f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
@@ -730,7 +751,7 @@ async def download_naip_area_tiles(
     )
 
     total_tiles = len(lat_centers) * len(lon_centers)
-    if total_tiles > MAX_TILES_PER_RUN:
+    if MAX_TILES_PER_RUN is not None and total_tiles > MAX_TILES_PER_RUN:
         raise ValueError(
             "Requested area requires "
             f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
@@ -1092,7 +1113,7 @@ async def _download_tiles_for_dim(
     )
 
     total_tiles = len(lat_centers) * len(lon_centers)
-    if total_tiles > MAX_TILES_PER_RUN:
+    if MAX_TILES_PER_RUN is not None and total_tiles > MAX_TILES_PER_RUN:
         raise ValueError(
             "Requested area requires "
             f"{total_tiles} tiles. Reduce coverage or increase the tile size to stay below "
