@@ -7,7 +7,7 @@ system stores detected objects and metadata in a SQLite database for later revie
 
 Key features:
 
-- **Image captioning** using BLIP to summarize the context of the uploaded scene.
+- **Image captioning** using BLIP-2 to summarize the context of the uploaded scene.
 - **Promptable visual question answering** to respond to analyst questions such as the default
   "Describe all unusual objects in this image".
 - **General object detection** powered by a DETR model capable of identifying a broad range of
@@ -33,7 +33,7 @@ Key features:
    pip install -e .
    ```
 
-   The first run will download the required Hugging Face models (BLIP for captioning and VILT for
+   The first run will download the required Hugging Face models (BLIP-2 for captioning and VILT for
    visual question answering). Expect this to take a few minutes.
 
 3. Configure your MapTiler API key (required for the default imagery provider):
