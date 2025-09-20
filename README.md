@@ -40,10 +40,15 @@ Key features:
 
    ```bash
    export MAPTILER_API_KEY="your_maptiler_api_key"
+   # Optional: set a Referer header if your MapTiler key is domain-restricted
+   # (for example when only localhost requests are allowed).
+   export MAPTILER_REFERER="http://localhost:8000"
    ```
 
-   You can create and manage keys from your MapTiler Cloud account. The key is read from the
-   environment at runtime, so shell configuration such as `.env` files also works.
+   You can create and manage keys from your MapTiler Cloud account. The downloader now uses the
+   Raster Tiles API and composites the required MapTiler attribution overlay locally, so the key
+   must include Raster (or Rendered Maps) access. Keys are read from the environment at runtime, so
+   shell configuration such as `.env` files also works.
 
 4. Launch the development server:
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
@@ -12,7 +13,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import httpx
 import xml.etree.ElementTree as ET
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
@@ -53,17 +54,22 @@ NAIP_COVERAGE_NOTE = (
     f"{NAIP_COVERAGE_LON_RANGE[0]:.1f}°–{NAIP_COVERAGE_LON_RANGE[1]:.1f}° longitude)."
 )
 
-MAPTILER_BASE_URL = "https://api.maptiler.com/maps"
+MAPTILER_TILE_BASE_URL = "https://api.maptiler.com/tiles"
 MAPTILER_STYLE = "satellite"
 MAPTILER_IMAGE_EXTENSION = "jpg"
 MAPTILER_IMAGE_FORMAT = "image/jpeg"
 MAPTILER_API_KEY_ENV = "MAPTILER_API_KEY"
+MAPTILER_REFERER_ENV = "MAPTILER_REFERER"
 MAPTILER_PIXELS_PER_DEGREE = 36000
 MAPTILER_MIN_TILE_PIXELS = 512
 MAPTILER_MAX_TILE_PIXELS = 2048
 MAPTILER_LATITUDE_LIMIT = 85.05112878
 MAPTILER_MAX_ZOOM = 20
 MAPTILER_LAYER_DESCRIPTION = "MapTiler satellite basemap (global high-res)"
+MAPTILER_TILESET = "satellite-v2"
+MAPTILER_TILE_SIZE = 512
+MAPTILER_ATTRIBUTION_TEXT = "© MapTiler"
+MAPTILER_JPEG_QUALITY = 95
 
 RECENT_LOOKBACK_DAYS = 1
 FALLBACK_LOOKBACK_DAYS = 3
@@ -224,11 +230,16 @@ async def download_maptiler_area_tiles(
     _validate_bounds(north=north, south=south, east=east, west=west)
     _validate_dim(dim)
 
-    api_key = os.getenv(MAPTILER_API_KEY_ENV)
+    api_key = os.getenv(MAPTILER_API_KEY_ENV, "").strip()
     if not api_key:
         raise ValueError(
             "MapTiler imagery requires the MAPTILER_API_KEY environment variable to be set."
         )
+
+    referer = os.getenv(MAPTILER_REFERER_ENV, "").strip()
+    request_headers: Dict[str, str] | None = None
+    if referer:
+        request_headers = {"Referer": referer}
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -294,47 +305,22 @@ async def download_maptiler_area_tiles(
                     height=tile_pixels,
                 )
 
-                url = (
-                    f"{MAPTILER_BASE_URL}/{MAPTILER_STYLE}/static/"
-                    f"{lon:.6f},{lat:.6f},{zoom}/{tile_pixels}x{tile_pixels}.{MAPTILER_IMAGE_EXTENSION}"
-                )
-
                 try:
-                    # Free MapTiler plans require the attribution overlay to remain enabled,
-                    # otherwise the API responds with an HTTP 403 image payload.
-                    params = {"key": api_key, "attribution": "true"}
-                    response = await client.get(
-                        url,
-                        params=params,
+                    image_bytes, rendered_pixels, source_detail = await _maptiler_render_tile_image(
+                        client=client,
+                        api_key=api_key,
+                        headers=request_headers,
+                        zoom=zoom,
+                        north=north_bound,
+                        south=south_bound,
+                        east=east_bound,
+                        west=west_bound,
+                        target_pixels=tile_pixels,
                     )
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    detail = _maptiler_http_error_detail(exc.response)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
-                    )
-                    logger.warning(
-                        "MapTiler imagery request failed with status %s: %s",
-                        exc.response.status_code,
-                        detail,
-                    )
-                    continue
-                except httpx.RequestError as exc:
-                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {exc}")
-                    logger.warning("MapTiler imagery request error: %s", exc)
-                    continue
-
-                if not _is_image_response(response):
-                    content_type = response.headers.get("Content-Type", "unknown")
-                    detail = _maptiler_http_error_detail(response)
-                    failures.append(
-                        f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
-                    )
-                    logger.warning(
-                        "MapTiler imagery request returned non-image payload (%s): %s",
-                        content_type,
-                        detail,
-                    )
+                except MapTilerDownloadError as exc:
+                    detail = str(exc)
+                    failures.append(f"lat {lat:.4f}, lon {lon:.4f}: {detail}")
+                    logger.warning("MapTiler imagery request failed: %s", detail)
                     continue
 
                 filename = _tile_filename(
@@ -345,17 +331,25 @@ async def download_maptiler_area_tiles(
                     extension=MAPTILER_IMAGE_EXTENSION,
                 )
                 tile_path = output_dir / filename
-                tile_path.write_bytes(response.content)
+                tile_path.write_bytes(image_bytes)
 
-                pixel_size = _actual_tile_size(tile_path, tile_pixels)
+                pixel_size = _actual_tile_size(tile_path, rendered_pixels)
                 pixels_per_degree = pixel_size / degree_span if degree_span > 0 else 0.0
+
+                source_url = source_detail or _maptiler_fallback_source_summary(
+                    zoom=zoom,
+                    west=west_bound,
+                    east=east_bound,
+                    south=south_bound,
+                    north=north_bound,
+                )
 
                 tiles.append(
                     AreaTile(
                         lat=lat,
                         lon=lon,
                         path=tile_path,
-                        source_url=str(response.url),
+                        source_url=source_url,
                         pixel_size=pixel_size,
                         degree_size=degree_span,
                         layer=MAPTILER_STYLE,
@@ -1213,6 +1207,211 @@ def _maptiler_tile_pixels(degree_span: float) -> int:
     return min(estimated, MAPTILER_MAX_TILE_PIXELS)
 
 
+class MapTilerDownloadError(Exception):
+    """Raised when the MapTiler tile imagery cannot be downloaded."""
+
+
+async def _maptiler_render_tile_image(
+    client: httpx.AsyncClient,
+    *,
+    api_key: str,
+    headers: Dict[str, str] | None,
+    zoom: int,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+    target_pixels: int,
+) -> Tuple[bytes, int, str]:
+    mosaic, urls = await _maptiler_download_tile_mosaic(
+        client=client,
+        api_key=api_key,
+        headers=headers,
+        zoom=zoom,
+        north=north,
+        south=south,
+        east=east,
+        west=west,
+    )
+
+    if mosaic.width == 0 or mosaic.height == 0:
+        raise MapTilerDownloadError("received empty MapTiler mosaic")
+
+    pixels = max(1, target_pixels)
+    if mosaic.size != (pixels, pixels):
+        mosaic = mosaic.resize((pixels, pixels), Image.LANCZOS)
+
+    mosaic = _apply_maptiler_attribution(mosaic)
+
+    buffer = io.BytesIO()
+    mosaic.save(buffer, format="JPEG", quality=MAPTILER_JPEG_QUALITY)
+    return buffer.getvalue(), mosaic.size[0], _summarize_maptiler_urls(urls)
+
+
+async def _maptiler_download_tile_mosaic(
+    client: httpx.AsyncClient,
+    *,
+    api_key: str,
+    headers: Dict[str, str] | None,
+    zoom: int,
+    north: float,
+    south: float,
+    east: float,
+    west: float,
+) -> Tuple[Image.Image, List[str]]:
+    tile_x_west = _maptiler_lon_to_tile_x(west, zoom)
+    tile_x_east = _maptiler_lon_to_tile_x(east, zoom)
+    tile_y_north = _maptiler_lat_to_tile_y(north, zoom)
+    tile_y_south = _maptiler_lat_to_tile_y(south, zoom)
+
+    x_start_frac, x_end_frac, x_min, x_max = _maptiler_tile_span(tile_x_west, tile_x_east, zoom)
+    y_start_frac, y_end_frac, y_min, y_max = _maptiler_tile_span(tile_y_north, tile_y_south, zoom)
+
+    columns = x_max - x_min + 1
+    rows = y_max - y_min + 1
+    if columns <= 0 or rows <= 0:
+        raise MapTilerDownloadError("invalid MapTiler tile coverage (empty mosaic)")
+
+    mosaic = Image.new("RGB", (columns * MAPTILER_TILE_SIZE, rows * MAPTILER_TILE_SIZE))
+    requested_urls: List[str] = []
+
+    for row, tile_y in enumerate(range(y_min, y_max + 1)):
+        for col, tile_x in enumerate(range(x_min, x_max + 1)):
+            url = _maptiler_tile_url(zoom=zoom, x=tile_x, y=tile_y)
+            tile_image, resolved_url = await _maptiler_request_tile(
+                client=client,
+                url=url,
+                api_key=api_key,
+                headers=headers,
+            )
+            mosaic.paste(tile_image, (col * MAPTILER_TILE_SIZE, row * MAPTILER_TILE_SIZE))
+            requested_urls.append(resolved_url)
+
+    x0 = max(0, min(mosaic.width, int(round((x_start_frac - x_min) * MAPTILER_TILE_SIZE))))
+    x1 = max(x0 + 1, min(mosaic.width, int(round((x_end_frac - x_min) * MAPTILER_TILE_SIZE))))
+    y0 = max(0, min(mosaic.height, int(round((y_start_frac - y_min) * MAPTILER_TILE_SIZE))))
+    y1 = max(y0 + 1, min(mosaic.height, int(round((y_end_frac - y_min) * MAPTILER_TILE_SIZE))))
+
+    cropped = mosaic.crop((x0, y0, x1, y1))
+    return cropped, requested_urls
+
+
+async def _maptiler_request_tile(
+    *,
+    client: httpx.AsyncClient,
+    url: str,
+    api_key: str,
+    headers: Dict[str, str] | None,
+) -> Tuple[Image.Image, str]:
+    params = {"key": api_key}
+    try:
+        response = await client.get(url, params=params, headers=headers)
+    except httpx.RequestError as exc:  # pragma: no cover - network failure path
+        raise MapTilerDownloadError(str(exc)) from exc
+
+    if response.status_code == 204:
+        raise MapTilerDownloadError("no imagery available (204 No Content)")
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = _maptiler_http_error_detail(exc.response)
+        raise MapTilerDownloadError(f"{exc.response.status_code} {detail}") from exc
+
+    if not _is_image_response(response):
+        content_type = response.headers.get("Content-Type", "unknown")
+        detail = _maptiler_http_error_detail(response)
+        raise MapTilerDownloadError(f"unexpected payload ({content_type}): {detail}")
+
+    try:
+        image = Image.open(io.BytesIO(response.content))
+        image.load()
+    except Exception as exc:  # pragma: no cover - defensive decoding guard
+        raise MapTilerDownloadError(f"unable to decode tile image: {exc}") from exc
+
+    sanitized_url = str(httpx.URL(str(response.url)).copy_with(query=None))
+    return image.convert("RGB"), sanitized_url
+
+
+def _maptiler_tile_url(*, zoom: int, x: int, y: int) -> str:
+    return f"{MAPTILER_TILE_BASE_URL}/{MAPTILER_TILESET}/{zoom}/{x}/{y}.{MAPTILER_IMAGE_EXTENSION}"
+
+
+def _maptiler_tile_span(start: float, end: float, zoom: int) -> Tuple[float, float, int, int]:
+    eps = 1e-9
+    scale = float(2 ** zoom)
+    start_clamped = min(max(min(start, end), 0.0), scale - eps)
+    end_clamped = min(max(max(start, end), 0.0), scale - eps)
+    low = int(math.floor(start_clamped))
+    high = int(math.floor(max(start_clamped, end_clamped - eps)))
+    if high < low:
+        high = low
+    return start_clamped, end_clamped, low, high
+
+
+def _maptiler_lon_to_tile_x(lon: float, zoom: int) -> float:
+    scale = float(2 ** zoom)
+    return (lon + 180.0) / 360.0 * scale
+
+
+def _maptiler_lat_to_tile_y(lat: float, zoom: int) -> float:
+    clamped = _clamp(lat, -MAPTILER_LATITUDE_LIMIT, MAPTILER_LATITUDE_LIMIT)
+    sin_lat = math.sin(math.radians(clamped))
+    fraction = 0.5 - math.log((1 + sin_lat) / (1 - sin_lat)) / (4 * math.pi)
+    return fraction * float(2 ** zoom)
+
+
+def _apply_maptiler_attribution(image: Image.Image) -> Image.Image:
+    base = image.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+    text = MAPTILER_ATTRIBUTION_TEXT
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    padding_x = max(4, base.width // 64)
+    padding_y = max(2, base.height // 64)
+
+    box_left = max(0, base.width - text_width - padding_x * 2)
+    box_top = max(0, base.height - text_height - padding_y * 2)
+    box = (box_left, box_top, base.width, base.height)
+    draw.rectangle(box, fill=(0, 0, 0, 160))
+    draw.text(
+        (box_left + padding_x, box_top + padding_y - bbox[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+    )
+
+    combined = Image.alpha_composite(base, overlay)
+    return combined.convert("RGB")
+
+
+def _summarize_maptiler_urls(urls: Sequence[str]) -> str:
+    resolved = [url for url in urls if url]
+    if not resolved:
+        return ""
+    if len(resolved) == 1:
+        return resolved[0]
+    return f"{resolved[0]} (and {len(resolved) - 1} more tiles)"
+
+
+def _maptiler_fallback_source_summary(
+    *,
+    zoom: int,
+    west: float,
+    east: float,
+    south: float,
+    north: float,
+) -> str:
+    return (
+        f"{MAPTILER_TILE_BASE_URL}/{MAPTILER_TILESET} "
+        f"z{zoom} lon[{west:.6f},{east:.6f}] lat[{south:.6f},{north:.6f}]"
+    )
+
+
 def _maptiler_zoom_level(
     *, north: float, south: float, east: float, west: float, width: int, height: int
 ) -> int:
@@ -1261,7 +1460,13 @@ def _naip_tile_intersects_coverage(
 
 
 def _maptiler_http_error_detail(response: httpx.Response) -> str:
-    """Summarize error responses from the MapTiler Static Maps API."""
+    """Summarize error responses from the MapTiler imagery endpoints."""
+
+    header_detail = response.headers.get("statustext")
+    if header_detail:
+        header_detail = header_detail.strip()
+        if header_detail:
+            return _short_error_detail(header_detail)
 
     content_type = response.headers.get("Content-Type", "").lower()
     content_bytes = getattr(response, "content", b"")
@@ -1271,8 +1476,8 @@ def _maptiler_http_error_detail(response: httpx.Response) -> str:
         if response.status_code in {401, 403}:
             return (
                 "forbidden (MapTiler returned an error image). Verify that the MAPTILER_API_KEY "
-                "environment variable is set correctly, the key includes Static Maps API access, "
-                "and the attribution/logo overlay remains enabled for free plans."
+                "environment variable is set correctly, the key includes Raster/Rendered tile "
+                "access, and the attribution/logo overlay remains enabled for free plans."
             )
         return f"{content_type} payload ({content_length} bytes)"
 
