@@ -334,6 +334,16 @@ class AreaTile:
     layer_description: str | None = field(default=None)
     provider: str = field(default=ImageryProviderKey.NASA_GIBS.value)
     provider_label: str | None = field(default=None)
+    sequence_index: int | None = field(default=None)
+    total_tiles: int | None = field(default=None)
+
+
+def _annotate_tile_sequence(tile: AreaTile, *, index: int, total: int) -> AreaTile:
+    """Attach ordering metadata to a tile for progress reporting."""
+
+    tile.sequence_index = index
+    tile.total_tiles = total
+    return tile
 
 
 async def download_area_tiles(
@@ -475,16 +485,34 @@ async def download_maptiler_area_tiles(
 
     cache = _get_tile_cache()
 
+    if total_tiles:
+        plural = "s" if total_tiles != 1 else ""
+        logger.info(
+            "Preparing to request %d MapTiler tile%s with %.2f° coverage per tile.",
+            total_tiles,
+            plural,
+            dim,
+        )
+    else:
+        logger.info("No MapTiler tiles required for the requested bounds.")
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        for lat in lat_centers:
+        tile_index = 0
+        for lat_center in lat_centers:
             _raise_if_cancelled(cancel_event)
-            for lon in lon_centers:
+            clamped_lat = _clamp(lat_center, clamp_min, clamp_max)
+            for lon_center in lon_centers:
                 _raise_if_cancelled(cancel_event)
-                lat = _clamp(lat, clamp_min, clamp_max)
-                south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
+                tile_index += 1
+                lon = lon_center
+                south_bound, north_bound, west_bound, east_bound = _tile_bounds(
+                    clamped_lat, lon, dim
+                )
                 south_bound = _clamp(south_bound, -lat_limit, lat_limit)
                 north_bound = _clamp(north_bound, -lat_limit, lat_limit)
-                degree_span = max(dim, north_bound - south_bound, east_bound - west_bound, MIN_DIM)
+                degree_span = max(
+                    dim, north_bound - south_bound, east_bound - west_bound, MIN_DIM
+                )
                 tile_pixels = _maptiler_tile_pixels(degree_span)
                 zoom = _maptiler_zoom_level(
                     north=north_bound,
@@ -496,7 +524,7 @@ async def download_maptiler_area_tiles(
                 )
 
                 filename = _tile_filename(
-                    lat,
+                    clamped_lat,
                     lon,
                     date,
                     prefix="maptiler",
@@ -505,7 +533,7 @@ async def download_maptiler_area_tiles(
                 tile_path = output_dir / filename
                 cache_key = _cache_key(
                     ImageryProviderKey.MAPTILER_SATELLITE.value,
-                    lat,
+                    clamped_lat,
                     lon,
                     degree_span,
                     zoom,
@@ -513,10 +541,22 @@ async def download_maptiler_area_tiles(
                     date or "",
                 )
 
+                progress_text = (
+                    f"Tile {tile_index}/{total_tiles}"
+                    if total_tiles
+                    else f"Tile {tile_index}"
+                )
+
                 cached_metadata = cache.load(cache_key, MAPTILER_IMAGE_EXTENSION, tile_path)
                 if cached_metadata is not None:
+                    logger.info(
+                        "%s: using cached MapTiler imagery at lat %.4f, lon %.4f.",
+                        progress_text,
+                        clamped_lat,
+                        lon,
+                    )
                     tile = _area_tile_from_metadata(
-                        lat=lat,
+                        lat=clamped_lat,
                         lon=lon,
                         path=tile_path,
                         metadata=cached_metadata,
@@ -528,9 +568,16 @@ async def download_maptiler_area_tiles(
                         default_native_dim=native_dim,
                         default_pixels_per_degree=MAPTILER_PIXELS_PER_DEGREE,
                     )
-                    tiles.append(tile)
+                    tiles.append(_annotate_tile_sequence(tile, index=tile_index, total=total_tiles))
                     await _notify_progress(progress_callback, tile)
                     continue
+
+                logger.info(
+                    "%s: downloading MapTiler imagery at lat %.4f, lon %.4f.",
+                    progress_text,
+                    clamped_lat,
+                    lon,
+                )
 
                 await _respect_rate_limit(cancel_event)
                 _raise_if_cancelled(cancel_event)
@@ -553,7 +600,9 @@ async def download_maptiler_area_tiles(
                     )
                 except MapTilerDownloadError as exc:
                     detail = str(exc)
-                    failure_message = f"lat {lat:.4f}, lon {lon:.4f}: {detail}"
+                    failure_message = (
+                        f"{progress_text} lat {clamped_lat:.4f}, lon {lon:.4f}: {detail}"
+                    )
                     failures.append(failure_message)
                     logger.warning("MapTiler imagery request failed: %s", detail)
                     await _notify_failure(failure_callback, failure_message)
@@ -590,7 +639,7 @@ async def download_maptiler_area_tiles(
                 )
 
                 tile = _area_tile_from_metadata(
-                    lat=lat,
+                    lat=clamped_lat,
                     lon=lon,
                     path=tile_path,
                     metadata=metadata,
@@ -602,7 +651,7 @@ async def download_maptiler_area_tiles(
                     default_native_dim=native_dim,
                     default_pixels_per_degree=MAPTILER_PIXELS_PER_DEGREE,
                 )
-                tiles.append(tile)
+                tiles.append(_annotate_tile_sequence(tile, index=tile_index, total=total_tiles))
                 await _notify_progress(progress_callback, tile)
 
     return tiles, failures
@@ -771,11 +820,29 @@ async def download_naip_area_tiles(
     provider_label = PROVIDER_METADATA[ImageryProviderKey.USGS_NAIP]["label"]
     cache = _get_tile_cache()
 
+    if total_tiles:
+        plural = "s" if total_tiles != 1 else ""
+        logger.info(
+            "Preparing USGS NAIP requests for %d tile%s at %.3f° span.",
+            total_tiles,
+            plural,
+            dim,
+        )
+    else:
+        logger.info("No USGS NAIP tiles required for the requested bounds.")
+
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        tile_index = 0
         for lat in lat_centers:
             _raise_if_cancelled(cancel_event)
             for lon in lon_centers:
                 _raise_if_cancelled(cancel_event)
+                tile_index += 1
+                progress_text = (
+                    f"Tile {tile_index}/{total_tiles}"
+                    if total_tiles
+                    else f"Tile {tile_index}"
+                )
                 south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
                 lat_span = max(north_bound - south_bound, MIN_DIM)
                 lon_span = max(east_bound - west_bound, MIN_DIM)
@@ -786,12 +853,13 @@ async def download_naip_area_tiles(
                     south_bound, north_bound, west_bound, east_bound
                 ):
                     failure_message = (
-                        f"lat {lat:.4f}, lon {lon:.4f}: {NAIP_COVERAGE_NOTE}"
+                        f"{progress_text} lat {lat:.4f}, lon {lon:.4f}: {NAIP_COVERAGE_NOTE}"
                     )
                     failures.append(failure_message)
                     logger.info(
-                        "Skipping NAIP tile at lat %.4f lon %.4f because it falls outside the service coverage "
+                        "%s: skipping NAIP tile at lat %.4f lon %.4f because it falls outside the service coverage "
                         "(lat %.1f°–%.1f°, lon %.1f°–%.1f°).",
+                        progress_text,
                         lat,
                         lon,
                         NAIP_COVERAGE_LAT_RANGE[0],
@@ -840,6 +908,12 @@ async def download_naip_area_tiles(
 
                 cached_metadata = cache.load(cache_key, ".jpg", tile_path)
                 if cached_metadata is not None:
+                    logger.info(
+                        "%s: using cached NAIP imagery at lat %.4f, lon %.4f.",
+                        progress_text,
+                        lat,
+                        lon,
+                    )
                     tile = _area_tile_from_metadata(
                         lat=lat,
                         lon=lon,
@@ -853,7 +927,9 @@ async def download_naip_area_tiles(
                         default_native_dim=native_dim,
                         default_pixels_per_degree=NAIP_PIXELS_PER_DEGREE,
                     )
-                    tiles.append(tile)
+                    tiles.append(
+                        _annotate_tile_sequence(tile, index=tile_index, total=total_tiles)
+                    )
                     await _notify_progress(progress_callback, tile)
                     continue
 
@@ -895,7 +971,8 @@ async def download_naip_area_tiles(
                                 f"(endpoint {endpoint}, version {version}, axis {axis_label})"
                             )
                             logger.warning(
-                                "USGS NAIP imagery request failed with status %s from %s (version %s, %s axis order): %s",
+                                "%s: USGS NAIP imagery request failed with status %s from %s (version %s, %s axis order): %s",
+                                progress_text,
                                 exc.response.status_code,
                                 endpoint,
                                 version,
@@ -908,7 +985,8 @@ async def download_naip_area_tiles(
                                 f"{exc} (endpoint {endpoint}, version {version}, axis {axis_label})"
                             )
                             logger.warning(
-                                "USGS NAIP imagery request error from %s (version %s, %s axis order): %s",
+                                "%s: USGS NAIP imagery request error from %s (version %s, %s axis order): %s",
+                                progress_text,
                                 endpoint,
                                 version,
                                 axis_label,
@@ -924,7 +1002,8 @@ async def download_naip_area_tiles(
                                 f"axis {axis_label}: {detail}"
                             )
                             logger.warning(
-                                "USGS NAIP imagery request returned non-image payload (%s) from %s (version %s, %s axis order): %s",
+                                "%s: USGS NAIP imagery request returned non-image payload (%s) from %s (version %s, %s axis order): %s",
+                                progress_text,
                                 content_type,
                                 endpoint,
                                 version,
@@ -937,7 +1016,8 @@ async def download_naip_area_tiles(
                         success_attempt = (version, axis_label)
                         if endpoint != NAIP_WMS_URLS[0]:
                             logger.info(
-                                "USGS NAIP imagery request succeeded using fallback endpoint %s (version %s, %s axis order)",
+                                "%s: USGS NAIP imagery request succeeded using fallback endpoint %s (version %s, %s axis order)",
+                                progress_text,
                                 endpoint,
                                 version,
                                 axis_label,
@@ -947,7 +1027,8 @@ async def download_naip_area_tiles(
                     if response is not None:
                         if success_attempt != ("1.3.0", "lon-lat"):
                             logger.info(
-                                "USGS NAIP imagery request succeeded using alternate configuration (version %s, %s axis order)",
+                                "%s: USGS NAIP imagery request succeeded using alternate configuration (version %s, %s axis order)",
+                                progress_text,
                                 version,
                                 axis_label,
                             )
@@ -955,7 +1036,9 @@ async def download_naip_area_tiles(
 
                 if response is None:
                     error_message = last_error or "no NAIP endpoints available"
-                    failure_message = f"lat {lat:.4f}, lon {lon:.4f}: {error_message}"
+                    failure_message = (
+                        f"{progress_text} lat {lat:.4f}, lon {lon:.4f}: {error_message}"
+                    )
                     failures.append(failure_message)
                     await _notify_failure(failure_callback, failure_message)
                     continue
@@ -994,7 +1077,9 @@ async def download_naip_area_tiles(
                     default_native_dim=native_dim,
                     default_pixels_per_degree=pixels_per_degree or NAIP_PIXELS_PER_DEGREE,
                 )
-                tiles.append(tile)
+                tiles.append(
+                    _annotate_tile_sequence(tile, index=tile_index, total=total_tiles)
+                )
                 await _notify_progress(progress_callback, tile)
 
     return tiles, failures
@@ -1135,10 +1220,24 @@ async def _download_tiles_for_dim(
     provider_label = PROVIDER_METADATA[ImageryProviderKey.NASA_GIBS]["label"]
     native_dim = _minimum_native_tile_dim(layer)
 
+    if total_tiles:
+        plural = "s" if total_tiles != 1 else ""
+        logger.info(
+            "Requesting %d GIBS tile%s from layer %s at %.3f° span.",
+            total_tiles,
+            plural,
+            layer.name,
+            dim,
+        )
+    else:
+        logger.info("No GIBS tiles required for the requested bounds.")
+
+    tile_index = 0
     for lat in lat_centers:
         _raise_if_cancelled(cancel_event)
         for lon in lon_centers:
             _raise_if_cancelled(cancel_event)
+            tile_index += 1
             south_bound, north_bound, west_bound, east_bound = _tile_bounds(lat, lon, dim)
             bbox = f"{south_bound:.6f},{west_bound:.6f},{north_bound:.6f},{east_bound:.6f}"
             params = {
@@ -1170,8 +1269,21 @@ async def _download_tiles_for_dim(
                 date or "",
             )
 
+            progress_text = (
+                f"Tile {tile_index}/{total_tiles}"
+                if total_tiles
+                else f"Tile {tile_index}"
+            )
+
             cached_metadata = cache.load(cache_key, ".png", tile_path)
             if cached_metadata is not None:
+                logger.info(
+                    "%s: using cached GIBS imagery from layer %s at lat %.4f, lon %.4f.",
+                    progress_text,
+                    layer.name,
+                    lat,
+                    lon,
+                )
                 tile = _area_tile_from_metadata(
                     lat=lat,
                     lon=lon,
@@ -1185,9 +1297,17 @@ async def _download_tiles_for_dim(
                     default_native_dim=native_dim,
                     default_pixels_per_degree=layer.pixels_per_degree,
                 )
-                tiles.append(tile)
+                tiles.append(_annotate_tile_sequence(tile, index=tile_index, total=total_tiles))
                 await _notify_progress(progress_callback, tile)
                 continue
+
+            logger.info(
+                "%s: requesting GIBS imagery from layer %s at lat %.4f, lon %.4f.",
+                progress_text,
+                layer.name,
+                lat,
+                lon,
+            )
 
             await _respect_rate_limit(cancel_event)
             _raise_if_cancelled(cancel_event)
@@ -1198,7 +1318,7 @@ async def _download_tiles_for_dim(
             except httpx.HTTPStatusError as exc:
                 detail = _short_error_detail(exc.response.text)
                 failure_message = (
-                    f"lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
+                    f"{progress_text} lat {lat:.4f}, lon {lon:.4f}: {exc.response.status_code} {detail}"
                 )
                 failures.append(failure_message)
                 logger.warning(
@@ -1209,7 +1329,7 @@ async def _download_tiles_for_dim(
                 await _notify_failure(failure_callback, failure_message)
                 continue
             except httpx.RequestError as exc:
-                failure_message = f"lat {lat:.4f}, lon {lon:.4f}: {exc}"
+                failure_message = f"{progress_text} lat {lat:.4f}, lon {lon:.4f}: {exc}"
                 failures.append(failure_message)
                 logger.warning("GIBS imagery request error: %s", exc)
                 await _notify_failure(failure_callback, failure_message)
@@ -1219,7 +1339,7 @@ async def _download_tiles_for_dim(
                 content_type = response.headers.get("Content-Type", "unknown")
                 detail = _short_error_detail(response.text)
                 failure_message = (
-                    f"lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
+                    f"{progress_text} lat {lat:.4f}, lon {lon:.4f}: unexpected payload ({content_type}): {detail}"
                 )
                 failures.append(failure_message)
                 logger.warning(
@@ -1259,7 +1379,7 @@ async def _download_tiles_for_dim(
                 default_native_dim=native_dim,
                 default_pixels_per_degree=layer.pixels_per_degree,
             )
-            tiles.append(tile)
+            tiles.append(_annotate_tile_sequence(tile, index=tile_index, total=total_tiles))
             await _notify_progress(progress_callback, tile)
 
     return tiles, failures
