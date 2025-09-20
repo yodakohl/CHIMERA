@@ -281,9 +281,12 @@ async def download_maptiler_area_tiles(
                 )
 
                 try:
+                    # Free MapTiler plans require the attribution overlay to remain enabled,
+                    # otherwise the API responds with an HTTP 403 image payload.
+                    params = {"key": api_key, "attribution": "true"}
                     response = await client.get(
                         url,
-                        params={"key": api_key, "attribution": "false"},
+                        params=params,
                     )
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
