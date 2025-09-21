@@ -49,12 +49,24 @@ def _configure_logging() -> None:
         config = deepcopy(UVICORN_LOGGING_CONFIG)
         config.setdefault("loggers", {})
         uvicorn_logger = config["loggers"].get("uvicorn", {})
-        handlers = uvicorn_logger.get("handlers", ["default"])
-        config["loggers"]["app"] = {
-            "handlers": handlers,
-            "level": "INFO",
-            "propagate": True,
-        }
+        handlers = list(uvicorn_logger.get("handlers", ["default"]))
+
+        app_logger_names = [
+            "app",
+            "app.main",
+            "app.services",
+            "app.services.analyzer",
+            "app.services.imagery",
+            "app.services.gpu_classifier",
+        ]
+
+        for name in app_logger_names:
+            config["loggers"][name] = {
+                "handlers": handlers,
+                "level": "INFO",
+                "propagate": False,
+            }
+
         logging.config.dictConfig(config)
     else:
         logging.basicConfig(level=logging.INFO)
