@@ -248,14 +248,20 @@ async def _analyze_tiles_with_fallback(
 
     image_paths = [tile.path for tile in tiles]
 
+    batch_size = len(tiles)
+    if batch_size > 1:
+        logger.info("Running batched analysis for %d tiles.", batch_size)
+
+    batch_failed = False
     try:
         batch_results = await _run_analysis_batch(analyzer, image_paths, prompt)
     except Exception as exc:  # pragma: no cover - defensive fallback
         logger.warning(
             "Batched analysis failed for %d tiles; falling back to single-image evaluation: %s",
-            len(tiles),
+            batch_size,
             exc,
         )
+        batch_failed = True
         batch_results = None
 
     if isinstance(batch_results, tuple):
@@ -263,7 +269,9 @@ async def _analyze_tiles_with_fallback(
 
     results: List[Tuple[Dict[str, object] | None, Exception | None]] = []
 
-    if isinstance(batch_results, list) and len(batch_results) == len(tiles):
+    if isinstance(batch_results, list) and len(batch_results) == batch_size:
+        if batch_size > 1:
+            logger.info("Batched analysis succeeded for %d tiles.", batch_size)
         for tile, analysis in zip(tiles, batch_results):
             if isinstance(analysis, dict):
                 results.append((analysis, None))
@@ -275,12 +283,24 @@ async def _analyze_tiles_with_fallback(
             else:
                 results.append((fallback_analysis, None))
     else:
-        if batch_results is not None:
-            logger.warning(
-                "Batched analysis returned %s results for %s tiles; evaluating individually.",
-                len(batch_results),
-                len(tiles),
-            )
+        if not batch_failed and batch_size > 1:
+            if batch_results is None:
+                logger.warning(
+                    "Batched analysis returned no results for %d tiles; evaluating individually.",
+                    batch_size,
+                )
+            elif isinstance(batch_results, list):
+                logger.warning(
+                    "Batched analysis returned %d result(s) for %d tiles; evaluating individually.",
+                    len(batch_results),
+                    batch_size,
+                )
+            else:
+                logger.warning(
+                    "Batched analysis produced unexpected result type %s for %d tiles; evaluating individually.",
+                    type(batch_results).__name__,
+                    batch_size,
+                )
         for tile in tiles:
             try:
                 analysis = await _run_analysis(analyzer, tile.path, prompt)
