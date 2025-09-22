@@ -8,6 +8,12 @@ state-of-the-art vision-language models. Users can upload satellite scenes, requ
 custom analysis prompt (defaulting to "Describe all unusual objects in this image"), and the
 system stores detected objects and metadata in a SQLite database for later review.
 
+**This is a POC coded mainly with AI.**
+
+Findings:
+- **BLIP and BLIP2 are not accurate enough to give any useful analysis**
+
+
 Key features:
 
 - **Image captioning** using BLIP-2 to summarize the context of the uploaded scene.
