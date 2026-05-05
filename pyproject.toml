@@ -14,13 +14,13 @@ dependencies = [
     "python-multipart>=0.0.9",
     "httpx>=0.26.0",
     "pillow>=9.5.0",
-    "transformers>=4.37.2",
+    "transformers>=4.50.0",
     "torch>=2.1.0",
     "timm>=0.9.12",
 ]
 
-[tool.setuptools]
-package-dir = {"" = "app"}
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.black]
 line-length = 100

@@ -16,7 +16,8 @@ Findings:
 
 Key features:
 
-- **Image captioning** using BLIP-2 to summarize the context of the uploaded scene.
+- **Configurable vision-language analysis** using the legacy BLIP-2/VILT pipeline or a SmolVLM
+  image-text backend for smaller promptable local inference.
 - **Promptable visual question answering** to respond to analyst questions such as the default
   "Describe all unusual objects in this image".
 - **General object detection** powered by a DETR model capable of identifying a broad range of
@@ -42,8 +43,17 @@ Key features:
    pip install -e .
    ```
 
-   The first run will download the required Hugging Face models (BLIP-2 for captioning and VILT for
-   visual question answering). Expect this to take a few minutes.
+   The first run will download the required Hugging Face models. By default this uses the legacy
+   BLIP-2 captioning and VILT visual question-answering models. To try the smaller SmolVLM backend
+   for both captioning and prompt responses, set:
+
+   ```bash
+   export CHIMERA_VLM_BACKEND=smolvlm
+   # Optional: override the default Hugging Face model.
+   export CHIMERA_SMOLVLM_MODEL="HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
+   ```
+
+   The DETR object detector is still used in both modes for bounding-box detections.
 
 3. Configure your MapTiler API key (required for the default imagery provider):
 
