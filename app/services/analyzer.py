@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
@@ -17,6 +18,15 @@ OBJECT_DETECTION_THRESHOLD = 0.25
 MAX_DETECTIONS = 20
 
 CAPTION_GENERATE_KWARGS = {"max_new_tokens": 80, "num_beams": 5}
+SMOLVLM_GENERATE_KWARGS = {"max_new_tokens": 128, "do_sample": False}
+SMOLVLM_CAPTION_PROMPT = (
+    "Describe this satellite image for an infrastructure analyst. Mention visible "
+    "land use, buildings, roads, vegetation, water, and any unusual objects."
+)
+DEFAULT_VLM_BACKEND = "legacy"
+SMOLVLM_MODEL_ID = "HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
+LEGACY_BACKENDS = {"legacy", "blip", "blip2", "blip-vilt"}
+SMOLVLM_BACKENDS = {"smolvlm", "smolvlm2"}
 
 DETAILED_DESCRIPTION_QUESTIONS: List[Tuple[str, str, int]] = [
     (
@@ -96,13 +106,24 @@ class SatelliteAnalyzer:
     """Wrapper around vision-language models for satellite object discovery."""
 
     def __init__(self) -> None:
-        logger.info("Loading captioning and VQA pipelines for satellite analysis")
-        self.captioning = pipeline(
-            "image-to-text", model="Salesforce/blip2-flan-t5-xl"
-        )
-        self.vqa = pipeline(
-            "visual-question-answering", model="dandelin/vilt-b32-finetuned-vqa"
-        )
+        self.backend = self._resolve_backend(os.getenv("CHIMERA_VLM_BACKEND"))
+        self.captioning = None
+        self.vqa = None
+        self.smolvlm_processor = None
+        self.smolvlm_model = None
+        self.smolvlm_device = None
+
+        if self.backend in SMOLVLM_BACKENDS:
+            self._load_smolvlm()
+        else:
+            logger.info("Loading BLIP-2 and VILT pipelines for satellite analysis")
+            self.captioning = pipeline(
+                "image-to-text", model="Salesforce/blip2-flan-t5-xl"
+            )
+            self.vqa = pipeline(
+                "visual-question-answering", model="dandelin/vilt-b32-finetuned-vqa"
+            )
+
         self.object_detector = pipeline(
             "object-detection", model="facebook/detr-resnet-50"
         )
@@ -172,6 +193,9 @@ class SatelliteAnalyzer:
         return self._compose_detailed_caption(base_caption, detail_answers)
 
     def _generate_base_caption(self, image: Image.Image) -> str:
+        if self.backend in SMOLVLM_BACKENDS:
+            return self._generate_vlm_text(SMOLVLM_CAPTION_PROMPT, image)
+
         try:
             result = self._run_captioning(image)
         except Exception as exc:  # pragma: no cover - model failure
@@ -182,6 +206,9 @@ class SatelliteAnalyzer:
     def _generate_base_captions_batch(self, images: Sequence[Image.Image]) -> List[str]:
         if not images:
             return []
+
+        if self.backend in SMOLVLM_BACKENDS:
+            return self._generate_vlm_text_batch(SMOLVLM_CAPTION_PROMPT, images)
 
         try:
             result = self._run_captioning(images)
@@ -207,6 +234,8 @@ class SatelliteAnalyzer:
     ) -> Dict[str, List[str]]:
         answers: Dict[str, List[str]] = {}
         if not images:
+            return answers
+        if self.backend in SMOLVLM_BACKENDS:
             return answers
 
         for key, question, _ in DETAILED_DESCRIPTION_QUESTIONS:
@@ -312,6 +341,9 @@ class SatelliteAnalyzer:
         return normalized
 
     def _run_captioning(self, inputs):
+        if self.captioning is None:
+            raise RuntimeError("Captioning pipeline is not loaded for this backend")
+
         attempts = (
             {"generate_kwargs": CAPTION_GENERATE_KWARGS},
             CAPTION_GENERATE_KWARGS,
@@ -330,6 +362,11 @@ class SatelliteAnalyzer:
         return self.captioning(inputs)
 
     def _ask_question(self, question: str, image: Image.Image) -> str:
+        if self.backend in SMOLVLM_BACKENDS:
+            return self._generate_vlm_text(question, image)
+        if self.vqa is None:
+            raise RuntimeError("VQA pipeline is not loaded for this backend")
+
         result = self.vqa(question=question, image=image)
         return self._extract_answer(result)
 
@@ -338,6 +375,11 @@ class SatelliteAnalyzer:
     ) -> List[str]:
         if not images:
             return []
+
+        if self.backend in SMOLVLM_BACKENDS:
+            return self._generate_vlm_text_batch(question, images)
+        if self.vqa is None:
+            raise RuntimeError("VQA pipeline is not loaded for this backend")
 
         inputs = [{"question": question, "image": image} for image in images]
 
@@ -460,6 +502,130 @@ class SatelliteAnalyzer:
             return [extractor(raw_batch)]
 
         return None
+
+    @staticmethod
+    def _resolve_backend(raw_backend: str | None) -> str:
+        backend = (raw_backend or DEFAULT_VLM_BACKEND).strip().lower()
+        if not backend:
+            return DEFAULT_VLM_BACKEND
+        if backend in LEGACY_BACKENDS or backend in SMOLVLM_BACKENDS:
+            return backend
+        valid = sorted(LEGACY_BACKENDS | SMOLVLM_BACKENDS)
+        raise ValueError(
+            f"Unsupported CHIMERA_VLM_BACKEND '{raw_backend}'. Expected one of: {', '.join(valid)}"
+        )
+
+    def _load_smolvlm(self) -> None:
+        model_id = os.getenv("CHIMERA_SMOLVLM_MODEL", SMOLVLM_MODEL_ID).strip()
+        if not model_id:
+            model_id = SMOLVLM_MODEL_ID
+
+        try:
+            import torch
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+        except ImportError as exc:  # pragma: no cover - dependency mismatch
+            raise RuntimeError(
+                "SmolVLM requires transformers with AutoModelForImageTextToText support "
+                "and torch installed. Run `pip install -e .` after updating dependencies."
+            ) from exc
+
+        logger.info("Loading SmolVLM backend %s for satellite analysis", model_id)
+        self.smolvlm_processor = AutoProcessor.from_pretrained(model_id)
+        self.smolvlm_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        model_kwargs: Dict[str, object] = {}
+        if self.smolvlm_device.type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                model_kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                model_kwargs["torch_dtype"] = torch.float16
+
+        try:
+            self.smolvlm_model = AutoModelForImageTextToText.from_pretrained(
+                model_id, **model_kwargs
+            )
+        except TypeError:
+            if "torch_dtype" in model_kwargs:
+                model_kwargs["dtype"] = model_kwargs.pop("torch_dtype")
+            self.smolvlm_model = AutoModelForImageTextToText.from_pretrained(
+                model_id, **model_kwargs
+            )
+
+        self.smolvlm_model.to(self.smolvlm_device)
+        self.smolvlm_model.eval()
+
+    def _generate_vlm_text(self, question: str, image: Image.Image) -> str:
+        responses = self._generate_vlm_text_batch(question, [image])
+        return responses[0] if responses else ""
+
+    def _generate_vlm_text_batch(
+        self, question: str, images: Sequence[Image.Image]
+    ) -> List[str]:
+        if not images:
+            return []
+        if (
+            self.smolvlm_processor is None
+            or self.smolvlm_model is None
+            or self.smolvlm_device is None
+        ):
+            raise RuntimeError("SmolVLM backend is not loaded")
+
+        try:
+            import torch
+        except ImportError as exc:  # pragma: no cover - dependency mismatch
+            raise RuntimeError("SmolVLM generation requires torch") from exc
+
+        conversations = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ]
+            for _image in images
+        ]
+        texts = [
+            self.smolvlm_processor.apply_chat_template(
+                conversation,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            for conversation in conversations
+        ]
+        inputs = self.smolvlm_processor(
+            text=texts,
+            images=list(images),
+            padding=True,
+            return_tensors="pt",
+        )
+
+        inputs = inputs.to(self.smolvlm_device)
+        with torch.no_grad():
+            generated_ids = self.smolvlm_model.generate(
+                **inputs,
+                **SMOLVLM_GENERATE_KWARGS,
+            )
+
+        input_token_count = inputs["input_ids"].shape[-1]
+        if generated_ids.shape[-1] > input_token_count:
+            generated_ids = generated_ids[:, input_token_count:]
+
+        decoded = self.smolvlm_processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+        )
+        return [self._clean_generated_text(text) for text in decoded]
+
+    @staticmethod
+    def _clean_generated_text(text: str) -> str:
+        cleaned = str(text or "").strip()
+        for prefix in ("Assistant:", "assistant:", "ASSISTANT:", "Assistant", "assistant"):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix) :].strip()
+        return cleaned
 
 
 @lru_cache()
