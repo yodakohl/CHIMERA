@@ -23,7 +23,12 @@ from pydantic import BaseModel
 
 from .database import DATA_DIR, get_session, init_db
 from .models import AnalysisResult, ApiUsageStat
-from .services.analyzer import DEFAULT_PROMPT, get_analyzer, serialize_detections
+from .services.analyzer import (
+    DEFAULT_PROMPT,
+    SMOLVLM_MODEL_ID,
+    get_analyzer,
+    serialize_detections,
+)
 from .services.imagery import (
     AreaTile,
     GIBS_DEFAULT_LAYER,
@@ -92,6 +97,8 @@ DEFAULT_SCAN_BOUNDS = {
 DEFAULT_SCAN_TILE_SIZE = 0.01
 DEFAULT_SCAN_DATE: str | None = None
 DEFAULT_IMAGERY_PROVIDER = ImageryProviderKey.MAPTILER_SATELLITE
+DEFAULT_ANALYSIS_MODEL = "legacy"
+CUSTOM_ANALYSIS_MODEL = "custom"
 
 RECLASSIFY_STREAM_BATCH_SIZE = 32
 AREA_SCAN_ANALYSIS_BATCH_SIZE = 32
@@ -105,6 +112,48 @@ PROVIDER_OPTIONS = [
     }
     for key, metadata in PROVIDER_METADATA.items()
 ]
+
+ANALYSIS_MODEL_OPTIONS = [
+    {
+        "key": "legacy",
+        "label": "Legacy BLIP-2 + VILT",
+        "description": "Original captioning and visual question-answering pipeline.",
+        "backend": "legacy",
+        "model_id": None,
+    },
+    {
+        "key": "smolvlm2-256m",
+        "label": "SmolVLM2 256M",
+        "description": "Smallest SmolVLM2 preset; fastest but weakest.",
+        "backend": "smolvlm",
+        "model_id": SMOLVLM_MODEL_ID,
+    },
+    {
+        "key": "smolvlm2-500m",
+        "label": "SmolVLM2 500M",
+        "description": "Larger SmolVLM2 preset for better prompt responses.",
+        "backend": "smolvlm",
+        "model_id": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+    },
+    {
+        "key": "smolvlm2-2.2b",
+        "label": "SmolVLM2 2.2B",
+        "description": "Largest bundled SmolVLM2 preset; slower and heavier.",
+        "backend": "smolvlm",
+        "model_id": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+    },
+    {
+        "key": CUSTOM_ANALYSIS_MODEL,
+        "label": "Custom image-text model",
+        "description": (
+            "Use a custom Hugging Face model compatible with "
+            "AutoModelForImageTextToText."
+        ),
+        "backend": "smolvlm",
+        "model_id": None,
+    },
+]
+ANALYSIS_MODEL_BY_KEY = {option["key"]: option for option in ANALYSIS_MODEL_OPTIONS}
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +178,17 @@ class ReclassifyTilePayload(BaseModel):
 class ReclassifyRequest(BaseModel):
     tiles: List[ReclassifyTilePayload]
     prompt: str = DEFAULT_PROMPT
+    analysis_model: str = DEFAULT_ANALYSIS_MODEL
+    custom_model: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisModelConfig:
+    key: str
+    label: str
+    backend: str
+    model_id: str | None = None
+    custom_model: str | None = None
 
 
 class ScanController:
@@ -201,6 +261,39 @@ def _resolve_cached_image(image_reference: str) -> tuple[Path, str]:
         raise FileNotFoundError(f"Cached image not found: {relative_path}")
 
     return candidate, str(relative_path).replace("\\", "/")
+
+
+def _resolve_analysis_model(
+    selected_model: str | None,
+    custom_model: str | None = None,
+) -> AnalysisModelConfig:
+    requested_key = (selected_model or DEFAULT_ANALYSIS_MODEL).strip()
+    option = ANALYSIS_MODEL_BY_KEY.get(requested_key)
+    if option is None:
+        requested_key = DEFAULT_ANALYSIS_MODEL
+        option = ANALYSIS_MODEL_BY_KEY[requested_key]
+
+    custom_model_id = (custom_model or "").strip() or None
+    model_id = option.get("model_id")
+    if requested_key == CUSTOM_ANALYSIS_MODEL:
+        if custom_model_id:
+            model_id = custom_model_id
+        else:
+            requested_key = DEFAULT_ANALYSIS_MODEL
+            option = ANALYSIS_MODEL_BY_KEY[requested_key]
+            model_id = option.get("model_id")
+
+    return AnalysisModelConfig(
+        key=str(requested_key),
+        label=str(option["label"]),
+        backend=str(option["backend"]),
+        model_id=str(model_id) if model_id else None,
+        custom_model=custom_model_id,
+    )
+
+
+def _get_configured_analyzer(model_config: AnalysisModelConfig):
+    return get_analyzer(model_config.backend, model_config.model_id)
 
 
 async def _register_scan(scan_id: str) -> ScanController:
@@ -327,9 +420,12 @@ async def analyze(
     request: Request,
     image: UploadFile = File(...),
     prompt: str = Form(DEFAULT_PROMPT),
+    analysis_model: str = Form(DEFAULT_ANALYSIS_MODEL),
+    custom_model: str | None = Form(None),
     session: Session = Depends(get_session),
 ):
-    analyzer = get_analyzer()
+    model_config = _resolve_analysis_model(analysis_model, custom_model)
+    analyzer = _get_configured_analyzer(model_config)
     saved_path = await _save_upload(image)
     analysis = await _run_analysis(analyzer, saved_path, prompt)
 
@@ -345,7 +441,13 @@ async def analyze(
     session.add(record)
     session.commit()
 
-    return _render_home(request, session, message="Analysis completed")
+    return _render_home(
+        request,
+        session,
+        message=f"Analysis completed using {model_config.label}.",
+        selected_analysis_model=model_config.key,
+        selected_custom_model=model_config.custom_model,
+    )
 
 
 @app.post("/scan-area", response_class=HTMLResponse)
@@ -358,10 +460,13 @@ async def scan_area(
     tile_size: float = Form(DEFAULT_SCAN_TILE_SIZE),
     provider: ImageryProviderKey = Form(DEFAULT_IMAGERY_PROVIDER),
     prompt: str = Form(DEFAULT_PROMPT),
+    analysis_model: str = Form(DEFAULT_ANALYSIS_MODEL),
+    custom_model: str | None = Form(None),
     date: str | None = Form(DEFAULT_SCAN_DATE),
     session: Session = Depends(get_session),
 ):
-    analyzer = get_analyzer()
+    model_config = _resolve_analysis_model(analysis_model, custom_model)
+    analyzer = _get_configured_analyzer(model_config)
     area_dir = AREA_SCAN_DIR / datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
     requested_date = (date or "").strip() or None
@@ -390,6 +495,8 @@ async def scan_area(
             session,
             message=str(exc),
             selected_provider=provider.value,
+            selected_analysis_model=model_config.key,
+            selected_custom_model=model_config.custom_model,
         )
 
     if not tiles:
@@ -412,6 +519,8 @@ async def scan_area(
             session,
             message=base_message,
             selected_provider=provider.value,
+            selected_analysis_model=model_config.key,
+            selected_custom_model=model_config.custom_model,
         )
 
     processed_records: List[AnalysisResult] = []
@@ -482,6 +591,8 @@ async def scan_area(
         session,
         message=message,
         selected_provider=provider.value,
+        selected_analysis_model=model_config.key,
+        selected_custom_model=model_config.custom_model,
     )
 
 
@@ -496,6 +607,8 @@ async def stream_scan_area(
     tile_size: float = Query(DEFAULT_SCAN_TILE_SIZE, alias="tile_size"),
     provider: ImageryProviderKey = Query(DEFAULT_IMAGERY_PROVIDER),
     prompt: str = Query(DEFAULT_PROMPT),
+    analysis_model: str = Query(DEFAULT_ANALYSIS_MODEL),
+    custom_model: str | None = Query(None),
     date: str | None = Query(DEFAULT_SCAN_DATE),
     session: Session = Depends(get_session),
 ):
@@ -504,7 +617,8 @@ async def stream_scan_area(
         raise HTTPException(status_code=400, detail="scan_id query parameter is required")
 
     controller = await _register_scan(scan_id)
-    analyzer = get_analyzer()
+    model_config = _resolve_analysis_model(analysis_model, custom_model)
+    analyzer = _get_configured_analyzer(model_config)
     area_dir = AREA_SCAN_DIR / datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
     requested_date = (date or "").strip() or None
@@ -712,8 +826,12 @@ async def stream_scan_area(
             await enqueue(
                 "status",
                 {
-                    "message": f"Starting scan using {provider_label} imagery.",
+                    "message": (
+                        f"Starting scan using {provider_label} imagery "
+                        f"and {model_config.label}."
+                    ),
                     "provider_label": provider_label,
+                    "analysis_model": model_config.label,
                 },
             )
             tiles, tile_failures = await download_area_tiles(
@@ -827,8 +945,9 @@ async def stop_scan(request: StopScanRequest) -> Dict[str, object]:
 async def reclassify_tiles(
     request: ReclassifyRequest, session: Session = Depends(get_session)
 ) -> StreamingResponse:
-    analyzer = get_analyzer()
     prompt = (request.prompt or "").strip() or DEFAULT_PROMPT
+    model_config = _resolve_analysis_model(request.analysis_model, request.custom_model)
+    analyzer = _get_configured_analyzer(model_config)
 
     async def stream() -> AsyncIterator[bytes]:
         total_processed = 0
@@ -853,6 +972,7 @@ async def reclassify_tiles(
                 "errors": errors_batch,
                 "processed": total_processed,
                 "prompt": prompt,
+                "analysis_model": model_config.label,
             }
             results_batch = []
             errors_batch = []
@@ -987,6 +1107,7 @@ async def reclassify_tiles(
                 "processed": 0,
                 "error_count": 0,
                 "prompt": prompt,
+                "analysis_model": model_config.label,
             }
             yield json.dumps(final_payload).encode("utf-8") + b"\n"
             return
@@ -1036,6 +1157,7 @@ async def reclassify_tiles(
             "processed": total_processed,
             "error_count": total_errors,
             "prompt": prompt,
+            "analysis_model": model_config.label,
         }
         yield json.dumps(final_payload).encode("utf-8") + b"\n"
 
@@ -1263,7 +1385,10 @@ def _render_home(
     message: str | None = None,
     *,
     selected_provider: str | None = None,
+    selected_analysis_model: str | None = None,
+    selected_custom_model: str | None = None,
 ):
+    model_config = _resolve_analysis_model(selected_analysis_model, selected_custom_model)
     context: Dict[str, object] = {
         "request": request,
         "default_prompt": DEFAULT_PROMPT,
@@ -1274,6 +1399,10 @@ def _render_home(
         "providers": PROVIDER_OPTIONS,
         "default_provider": DEFAULT_IMAGERY_PROVIDER.value,
         "selected_provider": selected_provider or DEFAULT_IMAGERY_PROVIDER.value,
+        "analysis_models": ANALYSIS_MODEL_OPTIONS,
+        "default_analysis_model": DEFAULT_ANALYSIS_MODEL,
+        "selected_analysis_model": model_config.key,
+        "selected_custom_model": model_config.custom_model or "",
         "min_tile_size": MIN_DIM,
         "max_tile_size": MAX_DIM,
         "api_usage": _build_api_usage(session),

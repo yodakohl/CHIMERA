@@ -42,6 +42,28 @@
           <label for="prompt">Analysis prompt</label>
           <textarea id="prompt" name="prompt" rows="3">{{ default_prompt }}</textarea>
 
+          <label for="upload-analysis-model">Vision model</label>
+          <select id="upload-analysis-model" name="analysis_model">
+            {% for option in analysis_models %}
+            <option
+              value="{{ option.key }}"
+              title="{{ option.description }}"
+              {% if option.key == selected_analysis_model %}selected{% endif %}
+            >
+              {{ option.label }}
+            </option>
+            {% endfor %}
+          </select>
+
+          <label for="upload-custom-model">Custom model</label>
+          <input
+            id="upload-custom-model"
+            name="custom_model"
+            type="text"
+            value="{{ selected_custom_model }}"
+            placeholder="HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+          />
+
           <button type="submit">Analyze image</button>
         </form>
       </details>
@@ -152,6 +174,31 @@
               name="date"
               type="date"
               {% if default_date %}value="{{ default_date }}"{% endif %}
+            />
+          </div>
+          <div class="field">
+            <label for="area-analysis-model">Vision model</label>
+            <select id="area-analysis-model" name="analysis_model">
+              {% for option in analysis_models %}
+              <option
+                value="{{ option.key }}"
+                title="{{ option.description }}"
+                {% if option.key == selected_analysis_model %}selected{% endif %}
+              >
+                {{ option.label }}
+              </option>
+              {% endfor %}
+            </select>
+            <p class="hint">SmolVLM presets replace the captioning and VQA model.</p>
+          </div>
+          <div class="field">
+            <label for="area-custom-model">Custom model</label>
+            <input
+              id="area-custom-model"
+              name="custom_model"
+              type="text"
+              value="{{ selected_custom_model }}"
+              placeholder="HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
             />
           </div>
         </div>
@@ -964,6 +1011,10 @@
             const promptInput = document.getElementById("area-prompt");
             const promptValue = promptInput ? promptInput.value : "";
             const prompt = (promptValue || "").trim() || defaultPrompt;
+            const modelInput = document.getElementById("area-analysis-model");
+            const customModelInput = document.getElementById("area-custom-model");
+            const analysis_model = modelInput ? modelInput.value : "";
+            const custom_model = customModelInput ? customModelInput.value : "";
 
             const tiles = Array.from(tileCache.values()).map((tile) => ({
               image: tile.image,
@@ -990,7 +1041,7 @@
             fetch("/scan-area/reclassify", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ prompt, tiles }),
+              body: JSON.stringify({ prompt, analysis_model, custom_model, tiles }),
             })
               .then((response) => {
                 if (!response.ok) {

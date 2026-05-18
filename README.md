@@ -43,9 +43,13 @@ Key features:
    pip install -e .
    ```
 
-   The first run will download the required Hugging Face models. By default this uses the legacy
-   BLIP-2 captioning and VILT visual question-answering models. To try the smaller SmolVLM backend
-   for both captioning and prompt responses, set:
+   The first run will download the required Hugging Face models. The web UI lets you choose the
+   vision-language model per upload, scan, or cached-tile reclassification. By default this uses
+   the legacy BLIP-2 captioning and VILT visual question-answering models. SmolVLM2 256M, 500M,
+   and 2.2B presets are available, and the custom model field accepts Hugging Face image-text
+   models compatible with `AutoModelForImageTextToText`.
+
+   To change the fallback model used when no UI selection is supplied, set:
 
    ```bash
    export CHIMERA_VLM_BACKEND=smolvlm

@@ -105,8 +105,15 @@ GENERIC_DETAIL_ANSWERS = {
 class SatelliteAnalyzer:
     """Wrapper around vision-language models for satellite object discovery."""
 
-    def __init__(self) -> None:
-        self.backend = self._resolve_backend(os.getenv("CHIMERA_VLM_BACKEND"))
+    def __init__(
+        self,
+        backend: str | None = None,
+        smolvlm_model: str | None = None,
+    ) -> None:
+        self.backend = self._resolve_backend(
+            backend if backend is not None else os.getenv("CHIMERA_VLM_BACKEND")
+        )
+        self.smolvlm_model_id = (smolvlm_model or "").strip() or None
         self.captioning = None
         self.vqa = None
         self.smolvlm_processor = None
@@ -516,7 +523,9 @@ class SatelliteAnalyzer:
         )
 
     def _load_smolvlm(self) -> None:
-        model_id = os.getenv("CHIMERA_SMOLVLM_MODEL", SMOLVLM_MODEL_ID).strip()
+        model_id = (
+            self.smolvlm_model_id or os.getenv("CHIMERA_SMOLVLM_MODEL", SMOLVLM_MODEL_ID)
+        ).strip()
         if not model_id:
             model_id = SMOLVLM_MODEL_ID
 
@@ -629,8 +638,15 @@ class SatelliteAnalyzer:
 
 
 @lru_cache()
-def get_analyzer() -> SatelliteAnalyzer:
-    return SatelliteAnalyzer()
+def get_analyzer(
+    backend: str | None = None,
+    smolvlm_model: str | None = None,
+) -> SatelliteAnalyzer:
+    normalized_backend = SatelliteAnalyzer._resolve_backend(
+        backend if backend is not None else os.getenv("CHIMERA_VLM_BACKEND")
+    )
+    normalized_model = (smolvlm_model or "").strip() or None
+    return SatelliteAnalyzer(normalized_backend, normalized_model)
 
 
 def serialize_detections(detections: Sequence[Dict[str, object]]) -> str:
